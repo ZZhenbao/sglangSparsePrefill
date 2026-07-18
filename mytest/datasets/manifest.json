@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "length_unit": "tokens",
+  "k_definition": 1024,
+  "token_id_range": [
+    1000,
+    30000
+  ],
+  "generator_seed": 1511464998,
+  "datasets": [
+    {
+      "file": "prefix_1k.json",
+      "prefix_length": 1024,
+      "suffix_count": 2,
+      "suffix_lengths": [
+        32,
+        32
+      ],
+      "sha256": "3734df61e878a3975b6d372812f2ec992fa6e1f3293b182cc177f8a60d351878"
+    },
+    {
+      "file": "prefix_2k.json",
+      "prefix_length": 2048,
+      "suffix_count": 2,
+      "suffix_lengths": [
+        32,
+        32
+      ],
+      "sha256": "e241d8d16d03cec77ebe74b668f54b3d05d5901c451a85f3f5170d6a5da8aca2"
+    },
+    {
+      "file": "prefix_4k.json",
+      "prefix_length": 4096,
+      "suffix_count": 2,
+      "suffix_lengths": [
+        32,
+        32
+      ],
+      "sha256": "049b76c1bf661400f3393706c6bd20730f2126dc316adde981702b46bc23f759"
+    },
+    {
+      "file": "prefix_10k.json",
+      "prefix_length": 10240,
+      "suffix_count": 2,
+      "suffix_lengths": [
+        32,
+        32
+      ],
+      "sha256": "fee0a0f8793165a4f12093122feeb64ee61cb23462ef29d3137cbe0225be50c5"
+    },
+    {
+      "file": "prefix_16k.json",
+      "prefix_length": 16384,
+      "suffix_count": 2,
+      "suffix_lengths": [
+        32,
+        32
+      ],
+      "sha256": "424b2acb3d892f398804af6fe06cf2c8520e09fef59e22dde5a20fdd24cfc9cf"
+    }
+  ]
+}

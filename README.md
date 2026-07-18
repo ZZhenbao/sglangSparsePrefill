@@ -1,3 +1,5 @@
+git describe --tags --exact-match HEAD
+v0.5.15.post1
 <div align="center" id="sglangtop">
 <img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
 

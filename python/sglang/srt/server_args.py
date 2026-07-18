@@ -170,6 +170,7 @@ ATTENTION_BACKEND_CHOICES = [
     # Common
     "triton",
     "torch_native",
+    "sparse_prefill",
     "flex_attention",
     "dsa",
     "nsa",  # Deprecated alias for "dsa"
@@ -1297,6 +1298,26 @@ class ServerArgs:
             choices=ATTENTION_BACKEND_CHOICES,
             resolvable=True,
         ),
+    ] = None
+    sparse_policy: A[
+        Optional[Literal["token_h2o", "fixed_chunk"]],
+        "The logical selection policy used by the experimental sparse prefill backend.",
+    ] = None
+    sparse_ratio: A[
+        Optional[float],
+        "The target fraction of cached prefix tokens selected by sparse prefill.",
+    ] = None
+    sparse_sink_tokens: A[
+        Optional[int],
+        "The number of mandatory tokens kept from the start of the cached prefix.",
+    ] = None
+    sparse_recent_tokens: A[
+        Optional[int],
+        "The recent-token window covered by the suffix first and then the cached prefix.",
+    ] = None
+    selection_unit_size: A[
+        Optional[int],
+        "The logical selection unit size. It is independent of the KV cache page size.",
     ] = None
     sampling_backend: A[
         Optional[str],
