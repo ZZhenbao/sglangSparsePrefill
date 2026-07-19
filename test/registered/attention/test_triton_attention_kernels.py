@@ -15,6 +15,9 @@ from sglang.srt.layers.attention.triton_ops.extend_attention import (
     extend_attention_fwd_unified,
     redundant_attention,
 )
+from sglang.srt.layers.attention.triton_ops.exact_sparse_extend_attention import (
+    exact_sparse_extend_attention_fwd,
+)
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
@@ -318,6 +321,90 @@ class TestTritonAttention(CustomTestCase):
         # Loop through the values and call the method
         for value in attention_values:
             self._test_extend_attention_once(19, 12331, 12, 4, value)
+
+    def test_exact_sparse_extend_attention(self):
+        device = get_device()
+        dtype = torch.bfloat16
+        suffix_len = 3
+        num_q_heads, num_kv_heads, head_dim = 4, 2, 64
+        page_size = 4
+        scale = head_dim**-0.5
+        k_descale, v_descale = 0.5, 2.0
+
+        query = torch.randn(
+            suffix_len,
+            num_q_heads,
+            head_dim,
+            dtype=dtype,
+            device=device,
+        )
+        suffix_key = torch.randn(
+            suffix_len,
+            num_kv_heads,
+            head_dim,
+            dtype=dtype,
+            device=device,
+        )
+        suffix_value = torch.randn_like(suffix_key)
+        key_cache = torch.randn(
+            4,
+            page_size,
+            num_kv_heads,
+            head_dim,
+            dtype=dtype,
+            device=device,
+        )
+        value_cache = torch.randn_like(key_cache)
+        selected_kv_slots = torch.tensor(
+            [[1, 6, 0, 0], [3, 8, 11, 0], [1, 6, 8, 11]],
+            dtype=torch.int64,
+            device=device,
+        )
+        selected_lens = torch.tensor(
+            [2, 3, 4],
+            dtype=torch.int32,
+            device=device,
+        )
+        output = torch.empty_like(query)
+
+        exact_sparse_extend_attention_fwd(
+            query,
+            suffix_key,
+            suffix_value,
+            output,
+            key_cache,
+            value_cache,
+            selected_kv_slots,
+            selected_lens,
+            k_descale,
+            v_descale,
+            sm_scale=scale,
+            page_size=page_size,
+        )
+
+        expected = torch.empty_like(output)
+        for query_idx in range(suffix_len):
+            selected_len = int(selected_lens[query_idx].item())
+            slots = selected_kv_slots[query_idx, :selected_len]
+            prefix_key = key_cache[
+                slots // page_size, slots % page_size
+            ] * k_descale
+            prefix_value = value_cache[
+                slots // page_size, slots % page_size
+            ] * v_descale
+            key = torch.cat((prefix_key, suffix_key[: query_idx + 1]), dim=0)
+            value = torch.cat((prefix_value, suffix_value[: query_idx + 1]), dim=0)
+            key = key.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
+            value = value.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
+            logits = torch.einsum(
+                "hd,shd->hs", query[query_idx].float(), key.float()
+            ) * scale
+            probability = torch.softmax(logits, dim=-1)
+            expected[query_idx] = torch.einsum(
+                "hs,shd->hd", probability, value.float()
+            ).to(dtype)
+
+        torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
 
     def test_extend_attention_block_sizes(self):
         from sglang.srt.layers.attention.triton_ops import extend_attention as ea

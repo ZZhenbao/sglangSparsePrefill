@@ -5,9 +5,11 @@ import unittest
 import torch
 
 from sglang.srt.layers.attention.sparse_prefill_backend import (
+    ExactSparseTritonMetadata,
     SparseExtendCall,
     SparseKVView,
     SparseSelectionPlan,
+    build_exact_sparse_triton_metadata,
     build_sparse_extend_call,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -27,7 +29,11 @@ class TestSparsePrefillConfig(CustomTestCase):
                 "--model-path",
                 "dummy",
                 "--attention-backend",
+                "triton",
+                "--prefill-attention-backend",
                 "sparse_prefill",
+                "--decode-attention-backend",
+                "triton",
                 "--sparse-policy",
                 "fixed_chunk",
                 "--sparse-ratio",
@@ -44,7 +50,10 @@ class TestSparsePrefillConfig(CustomTestCase):
         )
         args = ServerArgs.from_cli_args(parsed_args)
 
-        self.assertEqual(args.attention_backend, "sparse_prefill")
+        self.assertEqual(args.attention_backend, "triton")
+        self.assertEqual(args.prefill_attention_backend, "sparse_prefill")
+        self.assertEqual(args.decode_attention_backend, "triton")
+        self.assertEqual(args.get_attention_backends(), ("sparse_prefill", "triton"))
         self.assertEqual(args.sparse_policy, "fixed_chunk")
         self.assertEqual(args.sparse_ratio, 0.25)
         self.assertEqual(args.sparse_sink_tokens, 4)
@@ -77,13 +86,18 @@ class TestSparsePrefillMetadata(CustomTestCase):
     def test_sidecars_keep_logical_and_physical_metadata_separate(self):
         selected_unit_ids = torch.tensor([[0, 2], [0, 3]], dtype=torch.int32)
         selected_unit_lens = torch.tensor([2, 2], dtype=torch.int32)
-        selected_pos = torch.tensor([[0, 4], [0, 6]], dtype=torch.int32)
+        selected_pos = torch.tensor([[0, 4, -1], [0, 6, -1]], dtype=torch.int32)
         selected_lens = torch.tensor([2, 2], dtype=torch.int32)
         union_pos = torch.tensor([0, 4, 6], dtype=torch.int32)
-        selected_to_union = torch.tensor([[0, 1], [0, 2]], dtype=torch.int32)
+        selected_to_union = torch.tensor(
+            [[0, 1, -1], [0, 2, -1]], dtype=torch.int32
+        )
         page_union = torch.tensor([0, 1], dtype=torch.int32)
         selected_token_count = torch.tensor([2, 2], dtype=torch.int32)
         union_kv_slots = torch.tensor([17, 23, 41], dtype=torch.int64)
+        prefix_kv_slots = torch.tensor(
+            [17, 18, 19, 20, 23, 30, 41], dtype=torch.int64
+        )
 
         plan = SparseSelectionPlan(
             policy="token_h2o",
@@ -100,10 +114,12 @@ class TestSparsePrefillMetadata(CustomTestCase):
         )
         view = SparseKVView(union_kv_slots=union_kv_slots)
         call = build_sparse_extend_call(plan, view, 2)
+        triton_metadata = build_exact_sparse_triton_metadata(plan, prefix_kv_slots)
 
         self.assertTrue(dataclasses.is_dataclass(plan))
         self.assertTrue(dataclasses.is_dataclass(view))
         self.assertTrue(dataclasses.is_dataclass(call))
+        self.assertTrue(dataclasses.is_dataclass(triton_metadata))
         for field in (
             plan.selected_unit_ids,
             plan.selected_unit_lens,
@@ -131,6 +147,15 @@ class TestSparsePrefillMetadata(CustomTestCase):
         self.assertIs(view.union_kv_slots, union_kv_slots)
         self.assertIs(call.union_kv_slots, union_kv_slots)
         self.assertIsInstance(call, SparseExtendCall)
+        self.assertIsInstance(triton_metadata, ExactSparseTritonMetadata)
+        torch.testing.assert_close(
+            triton_metadata.selected_kv_slots,
+            torch.tensor([[17, 23, 0], [17, 41, 0]], dtype=torch.int64),
+        )
+        torch.testing.assert_close(
+            triton_metadata.selected_lens,
+            torch.tensor([2, 2], dtype=torch.int32),
+        )
 
         with self.assertRaises(dataclasses.FrozenInstanceError):
             plan.loaded_page_count = 3

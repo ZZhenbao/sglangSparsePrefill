@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Literal
 import torch
 from torch.nn.functional import scaled_dot_product_attention
 
-from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 
 if TYPE_CHECKING:
@@ -16,6 +16,12 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 SparsePolicy = Literal["token_h2o", "fixed_chunk"]
+
+
+def _create_triton_backend(model_runner: ModelRunner):
+    from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+    return TritonAttnBackend(model_runner)
 
 
 @dataclass(frozen=True)
@@ -52,6 +58,14 @@ class SparseKVView:
 class SparseExtendCall:
     union_kv_slots: torch.Tensor  # int64 [U]
     combined_mask: torch.Tensor  # bool [T, U + T]
+
+
+@dataclass(frozen=True)
+class ExactSparseTritonMetadata:
+    """Per-query physical prefix slots consumed by the exact sparse kernel."""
+
+    selected_kv_slots: torch.Tensor  # int64 [T, Kmax]
+    selected_lens: torch.Tensor  # int32 [T]
 
 
 def _expand_kv_heads(kv: torch.Tensor, num_query_heads: int) -> torch.Tensor:
@@ -432,6 +446,21 @@ def build_sparse_extend_call(
     )
 
 
+def build_exact_sparse_triton_metadata(
+    selection_plan: SparseSelectionPlan,
+    prefix_kv_slots: torch.Tensor,
+) -> ExactSparseTritonMetadata:
+    selected_pos = selection_plan.selected_pos.to(torch.int64)
+    selected_kv_slots = prefix_kv_slots.index_select(
+        0, selected_pos.clamp_min(0).flatten()
+    ).view_as(selected_pos)
+    selected_kv_slots.masked_fill_(selected_pos < 0, 0)
+    return ExactSparseTritonMetadata(
+        selected_kv_slots=selected_kv_slots,
+        selected_lens=selection_plan.selected_lens,
+    )
+
+
 def sparse_extend_sdpa(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -456,11 +485,26 @@ def sparse_extend_sdpa(
     return output.squeeze(0).movedim(0, 1)
 
 
-class SparsePrefillBackend(TorchNativeAttnBackend):
-    """Use dense attention for cache misses and sparse attention for prefix hits."""
+def _gather_cache_tokens(
+    cache: torch.Tensor,
+    slots: torch.Tensor,
+    page_size: int,
+) -> torch.Tensor:
+    if cache.ndim == 3:
+        return cache.index_select(0, slots)
+    return cache[slots // page_size, slots % page_size]
+
+
+class SparsePrefillBackend(AttentionBackend):
+    """Route dense work to Triton and exact sparse prefix hits to the P2 kernel."""
+
+    needs_cpu_seq_lens = False
 
     def __init__(self, model_runner: ModelRunner):
-        super().__init__(model_runner)
+        super().__init__()
+        self.dense_backend = _create_triton_backend(model_runner)
+        self.token_to_kv_pool = self.dense_backend.token_to_kv_pool
+        self.req_to_token_pool = self.dense_backend.req_to_token_pool
         server_args = model_runner.server_args
 
         self.sparse_policy = server_args.sparse_policy
@@ -468,7 +512,10 @@ class SparsePrefillBackend(TorchNativeAttnBackend):
         self.sparse_sink_tokens = server_args.sparse_sink_tokens
         self.sparse_recent_tokens = server_args.sparse_recent_tokens
         self.selection_unit_size = server_args.selection_unit_size
-        self.cache_page_size = self.token_to_kv_pool.page_size
+        self.cache_page_size = self.dense_backend.page_size
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        self.dense_backend.init_forward_metadata(forward_batch)
 
     def forward_extend(
         self,
@@ -479,49 +526,63 @@ class SparsePrefillBackend(TorchNativeAttnBackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
+        prefix_len = int(forward_batch.extend_prefix_lens[0].item())
+
+        if prefix_len == 0 or self.sparse_ratio == 1.0:
+            return self.dense_backend.forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache
+            )
+
         assert forward_batch.batch_size == 1, (
             "SparsePrefillBackend only supports one request"
         )
         assert save_kv_cache
 
-        prefix_len = int(forward_batch.extend_prefix_lens[0].item())
         suffix_len = int(forward_batch.extend_seq_lens[0].item())
-        seq_len = int(forward_batch.seq_lens[0].item())
+        dense_metadata = self.dense_backend.forward_metadata
+        prefix_kv_slots = dense_metadata.kv_indices[:prefix_len]
 
-        if prefix_len == 0:
-            return super().forward_extend(
-                q, k, v, layer, forward_batch, save_kv_cache
-            )
-
-        req_pool_idx = int(forward_batch.req_pool_indices[0].item())
-        kv_slots = self.req_to_token_pool.req_to_token[
-            req_pool_idx, :seq_len
-        ].to(torch.int64)
-        prefix_kv_slots = kv_slots[:prefix_len]
-        suffix_kv_slots = kv_slots[prefix_len:]
-        assert torch.equal(
-            suffix_kv_slots,
-            forward_batch.out_cache_loc.to(torch.int64),
+        loc_info = KVWriteLoc(
+            forward_batch.out_cache_loc,
+            dense_metadata.swa_out_cache_loc,
+            full_loc=dense_metadata.out_cache_loc_full_physical,
         )
+        if layer.k_scale is None:
+            self.dense_backend._set_kv_buffer(
+                forward_batch, layer, loc_info, k, v
+            )
+            k_descale = v_descale = 1.0
+        else:
+            self.dense_backend._set_kv_buffer(
+                forward_batch,
+                layer,
+                loc_info,
+                k.clone(),
+                v.clone(),
+                layer.k_scale,
+                layer.v_scale,
+            )
+            k_descale = layer.k_scale_float
+            v_descale = layer.v_scale_float
 
-        key_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        value_cache = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
-
-        self.token_to_kv_pool.set_kv_buffer(
-            layer,
-            KVWriteLoc(forward_batch.out_cache_loc, self.swa_out_cache_loc),
-            k,
-            v,
+        key_cache = self.dense_backend.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        value_cache = self.dense_backend.token_to_kv_pool.get_value_buffer(
+            layer.layer_id
         )
 
         query = q.view(suffix_len, layer.tp_q_head_num, layer.qk_head_dim)
-        prefix_key = key_cache.index_select(0, prefix_kv_slots)
-        suffix_key = key_cache.index_select(0, suffix_kv_slots)
+        prefix_key = _gather_cache_tokens(
+            key_cache,
+            prefix_kv_slots,
+            self.cache_page_size,
+        )
+        if layer.k_scale is not None:
+            prefix_key = prefix_key * k_descale
 
         token_scores = compute_causal_token_scores(
             query,
             prefix_key,
-            suffix_key,
+            k,
             scaling=layer.scaling,
         )
         selection_plan = materialize_selection_plan(
@@ -534,22 +595,27 @@ class SparsePrefillBackend(TorchNativeAttnBackend):
             selection_unit_size=self.selection_unit_size,
             cache_page_size=self.cache_page_size,
         )
-        sparse_kv_view = build_sparse_kv_view(
+        sparse_metadata = build_exact_sparse_triton_metadata(
             selection_plan,
             prefix_kv_slots,
         )
-        sparse_call = build_sparse_extend_call(
-            selection_plan,
-            sparse_kv_view,
-            suffix_len,
+        output = q.new_empty(
+            (suffix_len, layer.tp_q_head_num, layer.v_head_dim)
         )
-        output = sparse_extend_sdpa(
+        self.dense_backend.exact_sparse_extend_attention_fwd(
             query,
+            k.contiguous(),
+            v.contiguous(),
+            output,
             key_cache,
             value_cache,
-            suffix_kv_slots,
-            sparse_call,
-            scaling=layer.scaling,
+            sparse_metadata.selected_kv_slots,
+            sparse_metadata.selected_lens,
+            k_descale,
+            v_descale,
+            sm_scale=layer.scaling,
+            logit_cap=layer.logit_cap,
+            page_size=self.dense_backend.page_size,
         )
         return output.reshape(
             suffix_len,

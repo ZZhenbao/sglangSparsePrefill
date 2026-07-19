@@ -123,6 +123,9 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd,
             extend_attention_fwd_unified,
         )
+        from sglang.srt.layers.attention.triton_ops.exact_sparse_extend_attention import (
+            exact_sparse_extend_attention_fwd,
+        )
         from sglang.srt.layers.attention.triton_ops.verify_splitkv import (
             verify_splitkv_fwd,
         )
@@ -133,6 +136,9 @@ class TritonAttnBackend(AttentionBackend):
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
+        )
+        self.exact_sparse_extend_attention_fwd = torch.compiler.disable(
+            exact_sparse_extend_attention_fwd
         )
         self.build_unified_kv_indices = torch.compiler.disable(build_unified_kv_indices)
         # Split-KV EAGLE-verify kernel; enabled below once topk is known (valid only at topk == 1).

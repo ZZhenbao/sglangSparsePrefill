@@ -1,6 +1,6 @@
 # Qwen2.5-14B Sparse Prefix 测试命令
 
-本说明使用单张 A800、本地 Qwen2.5-14B-Instruct、`sparse_prefill` prefill backend 和 TorchNative decode。首次 cache miss 走 dense warm，后续完整 prefix hit 走 sparse 路径。
+本说明使用单张 A800、本地 Qwen2.5-14B-Instruct、`sparse_prefill` prefill backend 和 Triton decode。cache miss 与 full-ratio prefix hit 走 dense Triton，partial-ratio prefix hit 走 sparse Triton。
 
 ## 1. 进入环境
 
@@ -40,9 +40,9 @@ python -m sglang.launch_server \
   --pp-size 1 \
   --max-total-tokens 20000 \
   --max-running-requests 1 \
-  --attention-backend torch_native \
+  --attention-backend triton \
   --prefill-attention-backend sparse_prefill \
-  --decode-attention-backend torch_native \
+  --decode-attention-backend triton \
   --sparse-policy token_h2o \
   --sparse-ratio 1.0 \
   --sparse-sink-tokens 0 \
@@ -55,13 +55,13 @@ python -m sglang.launch_server \
   --disable-overlap-schedule
 ```
 
-必须显式设置全局 `--attention-backend torch_native`。当 prefill 和 decode backend 不同时，若省略全局 backend，SGLang 会为它选择默认值；当前 A800 环境会默认选择 FlashInfer，并触发不必要的 FlashInfer 版本检查。
+必须显式设置全局 `--attention-backend triton`。`sparse_prefill` 内部组合原 Triton extend backend，decode 则由 Hybrid backend 直接分发到独立的 Triton backend。
 
 `--disable-overlap-schedule` 是布尔开关，后面不加 `disabled`；正确拼写只有一个结尾 `e`。
 
 这里固定 `sparse-ratio=1.0`，目标是先验证 prefix KV 与 dense 等价，不是测稀疏收益。Qwen2.5-14B 本地配置的 context length 为 32K，因此最长的 `16K prefix + 32 suffix + 1 output` 在范围内。
 
-`max-total-tokens=20000` 足以容纳最长 case，同时避免把剩余显存全部分给 KV pool，为 16K dense TorchNative attention 保留 workspace。
+`max-total-tokens=20000` 足以容纳最长 case，同时避免把剩余显存全部分给 KV pool，为 16K Triton attention 保留 workspace。
 
 等待模型加载完成，然后在终端 2 检查服务：
 
@@ -88,7 +88,7 @@ flush
 → cold dense(prefix + suffix)
 → flush
 → dense warm(prefix, max_new_tokens=0)
-→ sparse hit(prefix + suffix)
+→ prefix hit(prefix + suffix)
 → 检查 cached_tokens == prefix_length
 → 比较 cold/hit 的 token 与 logprob
 → flush
@@ -144,7 +144,7 @@ for size in 1k 2k 4k 10k 16k; do
 done
 ```
 
-建议保持这个从短到长的顺序。16K cold dense/warm 使用 TorchNative SDPA，明显慢于短 case；若当前 PyTorch 回退到 math SDPA，也可能出现显存不足。该问题发生在 dense baseline，而不是 Radix prefix hit 本身。
+建议保持这个从短到长的顺序。16K cold dense 与 full-ratio warm 请求都显式走 Triton dense route；partial-ratio prefix hit 才进入逐 query exact-index sparse Triton 路径。
 
 成功时每个 suffix 会输出类似：
 
@@ -162,17 +162,28 @@ for size in 1k 2k 4k 10k 16k; do
 done
 ```
 
-## 5. 测试 fixed_chunk
+## 5. 强制验证 sparse Triton 路径
 
-停止服务，将启动命令中的两项改为：
+停止服务，将 `--sparse-ratio` 改为：
+
+```text
+--sparse-ratio 0.99999
+```
+
+重新启动后先运行 1K case。该比例不等于 `1.0`，因此会先独立执行 probe/selector，再由 exact sparse kernel 按每个 query 的物理 slot 列表重新计算 QK/softmax/AV；同时 `ceil(0.99999 * 1024) == 1024`，会选中完整 prefix，仍可与 dense 结果直接对齐。
+
+## 6. 测试 fixed_chunk
+
+停止服务，将启动命令中的三项改为：
 
 ```text
 --sparse-policy fixed_chunk
+--sparse-ratio 0.99999
 --selection-unit-size 16
 ```
 
-重新启动后复用第 3 节的测试命令。`ratio=1.0` 时 `token_h2o` 和 `fixed_chunk` 都应通过 dense 对齐。
+重新启动后先复用第 3 节的 1K 命令，验证 fixed-chunk 的 sparse Triton 路径。需要复查 full-ratio fast path 时，再将比例恢复为 `1.0`。
 
-## 6. 停止服务
+## 7. 停止服务
 
 在终端 1 按 `Ctrl+C`。
