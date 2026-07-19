@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one sparse-prefix dataset against an SGLang HTTP server."""
+"""Compare dense and sparse prefix hits for one dataset."""
 
 from __future__ import annotations
 
@@ -15,7 +15,14 @@ from typing import Any
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("dataset", type=Path)
-    parser.add_argument("--base-url", default="http://127.0.0.1:30000")
+    parser.add_argument(
+        "--dense-base-url",
+        default="http://127.0.0.1:30001",
+    )
+    parser.add_argument(
+        "--sparse-base-url",
+        default="http://127.0.0.1:30000",
+    )
     parser.add_argument("--timeout", type=float, default=1_800)
     parser.add_argument("--logprob-atol", type=float, default=0.1)
     parser.add_argument("--validate-only", action="store_true")
@@ -127,59 +134,58 @@ def normalize_logprobs(items: list[Any]) -> list[tuple[float, int]]:
 
 
 def compare_logprobs(
-    cold: dict[str, Any],
-    hit: dict[str, Any],
+    dense: dict[str, Any],
+    sparse: dict[str, Any],
     *,
     atol: float,
 ) -> float:
-    cold_meta = cold["meta_info"]
-    hit_meta = hit["meta_info"]
+    dense_meta = dense["meta_info"]
+    sparse_meta = sparse["meta_info"]
     fields = ("input_token_logprobs", "output_token_logprobs")
     max_abs_diff = 0.0
+    max_diff_detail = None
     for field in fields:
-        cold_values = normalize_logprobs(cold_meta[field])
-        hit_values = normalize_logprobs(hit_meta[field])
-        assert len(cold_values) == len(hit_values), (
+        dense_values = normalize_logprobs(dense_meta[field])
+        sparse_values = normalize_logprobs(sparse_meta[field])
+        assert len(dense_values) == len(sparse_values), (
             field,
-            len(cold_values),
-            len(hit_values),
+            len(dense_values),
+            len(sparse_values),
         )
-        assert cold_values, f"no comparable values in {field}"
-        for (cold_value, cold_token), (hit_value, hit_token) in zip(
-            cold_values, hit_values, strict=True
-        ):
-            assert cold_token == hit_token, (field, cold_token, hit_token)
-            max_abs_diff = max(max_abs_diff, abs(cold_value - hit_value))
-    assert max_abs_diff <= atol, (max_abs_diff, atol)
+        assert dense_values, f"no comparable values in {field}"
+        pairs = zip(dense_values, sparse_values, strict=True)
+        for index, (
+            (dense_value, dense_token),
+            (sparse_value, sparse_token),
+        ) in enumerate(pairs):
+            assert dense_token == sparse_token, (
+                field,
+                index,
+                dense_token,
+                sparse_token,
+            )
+            abs_diff = abs(dense_value - sparse_value)
+            if abs_diff > max_abs_diff:
+                max_abs_diff = abs_diff
+                max_diff_detail = (
+                    field,
+                    index,
+                    dense_token,
+                    dense_value,
+                    sparse_value,
+                )
+    assert max_abs_diff <= atol, (max_abs_diff, atol, max_diff_detail)
     return max_abs_diff
 
 
-def run_suffix_case(
-    dataset: dict[str, Any],
-    suffix: dict[str, Any],
+def run_prefix_hit(
     *,
     base_url: str,
+    prefix_ids: list[int],
+    full_input_ids: list[int],
     timeout: float,
-    logprob_atol: float,
-) -> None:
-    prefix_ids = dataset["prefix_input_ids"]
-    suffix_ids = suffix["input_ids"]
+) -> dict[str, Any]:
     prefix_length = len(prefix_ids)
-    full_input_ids = prefix_ids + suffix_ids
-    label = f'{dataset["name"]}/{suffix["name"]}'
-
-    print(f"[{label}] cold dense baseline")
-    flush_cache(base_url, timeout)
-    cold = generate(
-        base_url,
-        full_input_ids,
-        max_new_tokens=1,
-        timeout=timeout,
-        logprob_start_len=prefix_length,
-    )
-    assert cold["meta_info"]["cached_tokens"] == 0
-
-    print(f"[{label}] warm {prefix_length} prefix tokens")
     flush_cache(base_url, timeout)
     warm = generate(
         base_url,
@@ -189,7 +195,6 @@ def run_suffix_case(
     )
     assert warm["meta_info"]["cached_tokens"] == 0
 
-    print(f"[{label}] sparse prefix hit")
     hit = generate(
         base_url,
         full_input_ids,
@@ -201,13 +206,47 @@ def run_suffix_case(
         hit["meta_info"]["cached_tokens"],
         prefix_length,
     )
-    assert cold["output_ids"] == hit["output_ids"]
-    max_abs_diff = compare_logprobs(cold, hit, atol=logprob_atol)
+    return hit
+
+
+def run_suffix_case(
+    dataset: dict[str, Any],
+    suffix: dict[str, Any],
+    *,
+    dense_base_url: str,
+    sparse_base_url: str,
+    timeout: float,
+    logprob_atol: float,
+) -> None:
+    prefix_ids = dataset["prefix_input_ids"]
+    suffix_ids = suffix["input_ids"]
+    prefix_length = len(prefix_ids)
+    full_input_ids = prefix_ids + suffix_ids
+    label = f'{dataset["name"]}/{suffix["name"]}'
+
+    print(f"[{label}] dense warm + prefix hit")
+    dense = run_prefix_hit(
+        base_url=dense_base_url,
+        prefix_ids=prefix_ids,
+        full_input_ids=full_input_ids,
+        timeout=timeout,
+    )
+
+    print(f"[{label}] sparse warm + prefix hit")
+    sparse = run_prefix_hit(
+        base_url=sparse_base_url,
+        prefix_ids=prefix_ids,
+        full_input_ids=full_input_ids,
+        timeout=timeout,
+    )
+    assert dense["output_ids"] == sparse["output_ids"]
+    max_abs_diff = compare_logprobs(dense, sparse, atol=logprob_atol)
     print(
         f"[{label}] PASS cached_tokens={prefix_length} "
         f"max_abs_logprob_diff={max_abs_diff:.6g}"
     )
-    flush_cache(base_url, timeout)
+    flush_cache(dense_base_url, timeout)
+    flush_cache(sparse_base_url, timeout)
 
 
 def main() -> None:
@@ -220,13 +259,17 @@ def main() -> None:
     if args.validate_only:
         return
 
-    base_url = args.base_url.rstrip("/")
-    check_health(base_url, args.timeout)
+    dense_base_url = args.dense_base_url.rstrip("/")
+    sparse_base_url = args.sparse_base_url.rstrip("/")
+    assert dense_base_url != sparse_base_url
+    check_health(dense_base_url, args.timeout)
+    check_health(sparse_base_url, args.timeout)
     for suffix in dataset["suffixes"]:
         run_suffix_case(
             dataset,
             suffix,
-            base_url=base_url,
+            dense_base_url=dense_base_url,
+            sparse_base_url=sparse_base_url,
             timeout=args.timeout,
             logprob_atol=args.logprob_atol,
         )

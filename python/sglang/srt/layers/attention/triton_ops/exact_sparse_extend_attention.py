@@ -13,6 +13,9 @@ import triton.language as tl
 from sglang.srt.layers.attention.triton_ops.decode_attention import (
     _extract_kv_strides,
 )
+from sglang.srt.layers.attention.triton_ops.extend_attention import (
+    _get_block_sizes_for_extend_attention,
+)
 
 
 @triton.jit
@@ -222,9 +225,18 @@ def exact_sparse_extend_attention_fwd(
     v_head_dim = v_extend.shape[-1]
     kv_group_size = q.shape[1] // k_extend.shape[1]
     block_h = max(16, triton.next_power_of_2(kv_group_size))
-    block_d = triton.next_power_of_2(qk_head_dim)
-    block_dv = triton.next_power_of_2(v_head_dim)
-    block_n = 64
+    (
+        block_d,
+        block_dpe,
+        block_dv,
+        _,
+        block_n,
+        num_warps,
+        num_stages,
+    ) = _get_block_sizes_for_extend_attention(qk_head_dim, v_head_dim)
+    assert block_dpe == 0, (
+        "exact sparse extend does not support split head dimensions"
+    )
     sm_scale = sm_scale or qk_head_dim**-0.5
 
     k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = (
@@ -278,6 +290,6 @@ def exact_sparse_extend_attention_fwd(
         BLOCK_N=block_n,
         logit_cap=logit_cap,
         PAGE_SIZE=page_size,
-        num_warps=4,
-        num_stages=2,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )

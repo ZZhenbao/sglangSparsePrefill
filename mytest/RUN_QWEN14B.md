@@ -1,17 +1,25 @@
 # Qwen2.5-14B Sparse Prefix 测试命令
 
-本说明使用单张 A800、本地 Qwen2.5-14B-Instruct、`sparse_prefill` prefill backend 和 Triton decode。cache miss 与 full-ratio prefix hit 走 dense Triton，partial-ratio prefix hit 走 sparse Triton。
+本说明在单张 A800 上同时运行两个 Qwen2.5-14B-Instruct 服务：
+
+- `127.0.0.1:30000`：`sparse_prefill`，prefix hit 进入 exact sparse Triton；
+- `127.0.0.1:30001`：纯 dense Triton，提供相同 prefix-hit 执行分区的数值基线。
+
+测试不再用 cold full-prefill 作为 sparse 的直接数值基线。dense 与 sparse 服务分别建立相同 prefix cache，再比较两次 prefix-hit 的 token 和 logprob。
 
 ## 1. 进入环境
+
+每个终端都先执行：
 
 ```bash
 cd /home/zhenbao/Pro/SparsePrefill/sglangSparsePrefill
 conda activate sglang-prefill
 export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
 export CUDA_VISIBLE_DEVICES=0
+export MODEL_PATH=/data0/zhenbao/weight/models--Qwen--Qwen2.5-14B-Instruct/snapshots/cf98f3b3bbb457ad9e2bb7baf9a0125b6b88caa8
 ```
 
-确认加载的是当前仓库，而不是相邻的 SGLang checkout：
+确认加载的是当前仓库：
 
 ```bash
 python -c "import importlib.util; print(importlib.util.find_spec('sglang').origin)"
@@ -23,13 +31,11 @@ python -c "import importlib.util; print(importlib.util.find_spec('sglang').origi
 /home/zhenbao/Pro/SparsePrefill/sglangSparsePrefill/python/sglang/__init__.py
 ```
 
-## 2. 启动服务
+## 2. 启动 sparse 服务
 
 在终端 1 执行：
 
 ```bash
-export MODEL_PATH=/data0/zhenbao/weight/models--Qwen--Qwen2.5-14B-Instruct/snapshots/cf98f3b3bbb457ad9e2bb7baf9a0125b6b88caa8
-
 python -m sglang.launch_server \
   --model-path "$MODEL_PATH" \
   --host 127.0.0.1 \
@@ -38,6 +44,7 @@ python -m sglang.launch_server \
   --tp-size 1 \
   --dp-size 1 \
   --pp-size 1 \
+  --random-seed 0 \
   --max-total-tokens 20000 \
   --max-running-requests 1 \
   --attention-backend triton \
@@ -55,50 +62,65 @@ python -m sglang.launch_server \
   --disable-overlap-schedule
 ```
 
-必须显式设置全局 `--attention-backend triton`。`sparse_prefill` 内部组合原 Triton extend backend，decode 则由 Hybrid backend 直接分发到独立的 Triton backend。
+`sparse-ratio=1.0` 让 selector 为每个 suffix query 选择完整 prefix，但请求仍进入 exact sparse kernel。
 
-`--disable-overlap-schedule` 是布尔开关，后面不加 `disabled`；正确拼写只有一个结尾 `e`。
+## 3. 启动 dense 基线服务
 
-这里固定 `sparse-ratio=1.0`，目标是先验证 prefix KV 与 dense 等价，不是测稀疏收益。Qwen2.5-14B 本地配置的 context length 为 32K，因此最长的 `16K prefix + 32 suffix + 1 output` 在范围内。
+在终端 2 执行：
 
-`max-total-tokens=20000` 足以容纳最长 case，同时避免把剩余显存全部分给 KV pool，为 16K Triton attention 保留 workspace。
+```bash
+python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" \
+  --host 127.0.0.1 \
+  --port 30001 \
+  --dtype bfloat16 \
+  --tp-size 1 \
+  --dp-size 1 \
+  --pp-size 1 \
+  --random-seed 0 \
+  --max-total-tokens 20000 \
+  --max-running-requests 1 \
+  --attention-backend triton \
+  --page-size 1 \
+  --chunked-prefill-size -1 \
+  --cuda-graph-backend-prefill disabled \
+  --cuda-graph-backend-decode disabled \
+  --disable-overlap-schedule
+```
 
-等待模型加载完成，然后在终端 2 检查服务：
+等待两个服务完成加载：
 
 ```bash
 curl -f http://127.0.0.1:30000/health
+curl -f http://127.0.0.1:30001/health
 ```
 
-该接口成功时可能没有响应正文，以退出码 0 为准。
+两个服务都显式限制 `max-total-tokens=20000`。单张 80 GiB A800 可以同时容纳两份模型和最长 16K case 的 KV cache。
 
-## 3. 测试五组 Prefix
+## 4. 测试五组 Prefix
 
-先进入与终端 1 相同的目录和环境：
-
-```bash
-cd /home/zhenbao/Pro/SparsePrefill/sglangSparsePrefill
-conda activate sglang-prefill
-export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
-```
-
-每条命令都会测试该 prefix 对应的两个 suffix。对每个 suffix，客户端自动执行：
+在终端 3 进入第 1 节的环境。每个 suffix 的测试流程为：
 
 ```text
-flush
-→ cold dense(prefix + suffix)
-→ flush
+dense flush
 → dense warm(prefix, max_new_tokens=0)
-→ prefix hit(prefix + suffix)
-→ 检查 cached_tokens == prefix_length
-→ 比较 cold/hit 的 token 与 logprob
-→ flush
+→ dense prefix-hit(prefix + suffix)
+
+sparse flush
+→ sparse warm(prefix, max_new_tokens=0)
+→ sparse prefix-hit(prefix + suffix)
+
+→ 检查两边 cached_tokens == prefix_length
+→ 比较 dense-hit 与 sparse-hit 的 output token 和 logprob
+→ flush 两个服务
 ```
 
 ### 1K Prefix
 
 ```bash
 python mytest/run_prefix_case.py mytest/datasets/prefix_1k.json \
-  --base-url http://127.0.0.1:30000 \
+  --dense-base-url http://127.0.0.1:30001 \
+  --sparse-base-url http://127.0.0.1:30000 \
   --logprob-atol 0.1
 ```
 
@@ -106,7 +128,8 @@ python mytest/run_prefix_case.py mytest/datasets/prefix_1k.json \
 
 ```bash
 python mytest/run_prefix_case.py mytest/datasets/prefix_2k.json \
-  --base-url http://127.0.0.1:30000 \
+  --dense-base-url http://127.0.0.1:30001 \
+  --sparse-base-url http://127.0.0.1:30000 \
   --logprob-atol 0.1
 ```
 
@@ -114,7 +137,8 @@ python mytest/run_prefix_case.py mytest/datasets/prefix_2k.json \
 
 ```bash
 python mytest/run_prefix_case.py mytest/datasets/prefix_4k.json \
-  --base-url http://127.0.0.1:30000 \
+  --dense-base-url http://127.0.0.1:30001 \
+  --sparse-base-url http://127.0.0.1:30000 \
   --logprob-atol 0.1
 ```
 
@@ -122,7 +146,8 @@ python mytest/run_prefix_case.py mytest/datasets/prefix_4k.json \
 
 ```bash
 python mytest/run_prefix_case.py mytest/datasets/prefix_10k.json \
-  --base-url http://127.0.0.1:30000 \
+  --dense-base-url http://127.0.0.1:30001 \
+  --sparse-base-url http://127.0.0.1:30000 \
   --logprob-atol 0.1
 ```
 
@@ -130,7 +155,8 @@ python mytest/run_prefix_case.py mytest/datasets/prefix_10k.json \
 
 ```bash
 python mytest/run_prefix_case.py mytest/datasets/prefix_16k.json \
-  --base-url http://127.0.0.1:30000 \
+  --dense-base-url http://127.0.0.1:30001 \
+  --sparse-base-url http://127.0.0.1:30000 \
   --logprob-atol 0.1
 ```
 
@@ -139,22 +165,23 @@ python mytest/run_prefix_case.py mytest/datasets/prefix_16k.json \
 ```bash
 for size in 1k 2k 4k 10k 16k; do
   python mytest/run_prefix_case.py "mytest/datasets/prefix_${size}.json" \
-    --base-url http://127.0.0.1:30000 \
+    --dense-base-url http://127.0.0.1:30001 \
+    --sparse-base-url http://127.0.0.1:30000 \
     --logprob-atol 0.1 || break
 done
 ```
 
-建议保持这个从短到长的顺序。16K cold dense 与 full-ratio warm 请求都显式走 Triton dense route；partial-ratio prefix hit 才进入逐 query exact-index sparse Triton 路径。
-
-成功时每个 suffix 会输出类似：
+成功时输出类似：
 
 ```text
+[prefix_1k/suffix_1] dense warm + prefix hit
+[prefix_1k/suffix_1] sparse warm + prefix hit
 [prefix_1k/suffix_1] PASS cached_tokens=1024 max_abs_logprob_diff=...
 ```
 
-## 4. 只检查数据文件
+## 5. 只检查数据文件
 
-不启动服务时，可以先验证数据长度与结构：
+不启动服务时执行：
 
 ```bash
 for size in 1k 2k 4k 10k 16k; do
@@ -162,28 +189,17 @@ for size in 1k 2k 4k 10k 16k; do
 done
 ```
 
-## 5. 强制验证 sparse Triton 路径
-
-停止服务，将 `--sparse-ratio` 改为：
-
-```text
---sparse-ratio 0.99999
-```
-
-重新启动后先运行 1K case。该比例不等于 `1.0`，因此会先独立执行 probe/selector，再由 exact sparse kernel 按每个 query 的物理 slot 列表重新计算 QK/softmax/AV；同时 `ceil(0.99999 * 1024) == 1024`，会选中完整 prefix，仍可与 dense 结果直接对齐。
-
 ## 6. 测试 fixed_chunk
 
-停止服务，将启动命令中的三项改为：
+停止 sparse 服务，将以下参数改为：
 
 ```text
 --sparse-policy fixed_chunk
---sparse-ratio 0.99999
 --selection-unit-size 16
 ```
 
-重新启动后先复用第 3 节的 1K 命令，验证 fixed-chunk 的 sparse Triton 路径。需要复查 full-ratio fast path 时，再将比例恢复为 `1.0`。
+保持 `--sparse-ratio 1.0` 并重新启动 sparse 服务。dense 服务不变，复用第 4 节测试命令。
 
 ## 7. 停止服务
 
-在终端 1 按 `Ctrl+C`。
+分别在终端 1 和终端 2 按 `Ctrl+C`。

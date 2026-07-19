@@ -496,7 +496,7 @@ def _gather_cache_tokens(
 
 
 class SparsePrefillBackend(AttentionBackend):
-    """Route dense work to Triton and exact sparse prefix hits to the P2 kernel."""
+    """Use dense Triton for cache misses and exact sparse Triton for prefix hits."""
 
     needs_cpu_seq_lens = False
 
@@ -528,7 +528,7 @@ class SparsePrefillBackend(AttentionBackend):
     ) -> torch.Tensor:
         prefix_len = int(forward_batch.extend_prefix_lens[0].item())
 
-        if prefix_len == 0 or self.sparse_ratio == 1.0:
+        if prefix_len == 0:
             return self.dense_backend.forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache
             )

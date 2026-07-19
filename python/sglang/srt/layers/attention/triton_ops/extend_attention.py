@@ -43,7 +43,8 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
         Lv: Value head dimension
 
     Returns:
-        tuple: (BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps)
+        tuple: (BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N,
+            num_warps, num_stages)
     """
     # Determine BLOCK_DMODEL and BLOCK_DPE based on head dimension
     if Lq == 576:
@@ -122,7 +123,16 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
 
         num_warps = 4 if Lq <= 64 else 8
 
-    return BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps
+    num_stages = 1
+    return (
+        BLOCK_DMODEL,
+        BLOCK_DPE,
+        BLOCK_DV,
+        BLOCK_M,
+        BLOCK_N,
+        num_warps,
+        num_stages,
+    )
 
 
 @triton.jit
@@ -664,9 +674,15 @@ def extend_attention_fwd(
     )
 
     # Get block sizes and configuration
-    BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
-        _get_block_sizes_for_extend_attention(Lq, Lv)
-    )
+    (
+        BLOCK_DMODEL,
+        BLOCK_DPE,
+        BLOCK_DV,
+        BLOCK_M,
+        BLOCK_N,
+        num_warps,
+        num_stages,
+    ) = _get_block_sizes_for_extend_attention(Lq, Lv)
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
@@ -682,8 +698,6 @@ def extend_attention_fwd(
     stride_lse_h = lse_extend.stride(1) if STORE_LSE else 0
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
-    num_stages = 1
-
     extra_kargs = {}
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
@@ -1129,9 +1143,15 @@ def extend_attention_fwd_unified(
     Lq, Lv = q.shape[-1], v_buffer.shape[-1]
 
     # Get block sizes and configuration
-    BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
-        _get_block_sizes_for_extend_attention(Lq, Lv)
-    )
+    (
+        BLOCK_DMODEL,
+        BLOCK_DPE,
+        BLOCK_DV,
+        BLOCK_M,
+        BLOCK_N,
+        num_warps,
+        num_stages,
+    ) = _get_block_sizes_for_extend_attention(Lq, Lv)
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q.shape[1]
@@ -1149,8 +1169,6 @@ def extend_attention_fwd_unified(
         window_start_pos = torch.zeros(batch_size, dtype=torch.int32, device=q.device)
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
-    num_stages = 1
-
     extra_kargs = {}
     if _is_hip:
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}

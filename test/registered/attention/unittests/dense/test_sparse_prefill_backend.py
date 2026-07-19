@@ -156,7 +156,7 @@ class TestSparsePrefillBackend(CustomTestCase):
             backend = ATTENTION_BACKENDS["sparse_prefill"](fixture.runner)
         return replace_backend(fixture, backend)
 
-    def test_full_ratio_explicitly_routes_dense(self):
+    def test_full_ratio_routes_exact_sparse_triton_kernel(self):
         for policy, selection_unit_size in (
             ("token_h2o", 1),
             ("fixed_chunk", 3),
@@ -173,23 +173,41 @@ class TestSparsePrefillBackend(CustomTestCase):
                     fixture.runner.req_to_token_pool.req_to_token.clone()
                 )
                 expected = expected_dense_fixture_output(fixture)
-                with (
-                    mock.patch.object(
-                        sparse_backend_module, "compute_causal_token_scores"
-                    ) as probe,
-                    mock.patch.object(
-                        sparse_backend_module, "materialize_selection_plan"
-                    ) as selector,
+                selection_plans = []
+                materialize_selection_plan = (
+                    sparse_backend_module.materialize_selection_plan
+                )
+
+                def capture_selection_plan(*args, **kwargs):
+                    selection_plan = materialize_selection_plan(*args, **kwargs)
+                    selection_plans.append(selection_plan)
+                    return selection_plan
+
+                with mock.patch.object(
+                    sparse_backend_module,
+                    "materialize_selection_plan",
+                    side_effect=capture_selection_plan,
                 ):
                     actual = run_dense_fixture_eager(fixture)
 
-                probe.assert_not_called()
-                selector.assert_not_called()
-                self.assertEqual(fixture.backend.dense_backend.dense_forward_calls, 1)
+                self.assertEqual(fixture.backend.dense_backend.dense_forward_calls, 0)
                 self.assertEqual(
-                    fixture.backend.dense_backend.sparse_kv_write_calls, 0
+                    fixture.backend.dense_backend.sparse_kv_write_calls, 1
                 )
-                self.assertEqual(fixture.backend.dense_backend.sparse_kernel_calls, 0)
+                self.assertEqual(fixture.backend.dense_backend.sparse_kernel_calls, 1)
+                self.assertEqual(len(selection_plans), 1)
+                torch.testing.assert_close(
+                    selection_plans[0].selected_lens,
+                    torch.full((3,), 7, dtype=torch.int32),
+                )
+                torch.testing.assert_close(
+                    selection_plans[0].selected_pos,
+                    torch.arange(7, dtype=torch.int32).expand(3, -1),
+                )
+                torch.testing.assert_close(
+                    fixture.backend.dense_backend.last_selected_lens,
+                    selection_plans[0].selected_lens,
+                )
 
                 torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
                 torch.testing.assert_close(
