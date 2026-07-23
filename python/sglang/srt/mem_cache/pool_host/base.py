@@ -237,23 +237,43 @@ class HostKVCache(abc.ABC):
     def available_size(self):
         return len(self.free_slots)
 
+    # 从预先创建的 L2 Host KV Pool 中预留 token slot。
+    # 返回值只负责维护“逻辑 token -> Host 物理 slot”的映射；
+    # 当前 Sparse Prefill 会在 load-back 后按显式 GPU slot 访问，不要求整个 prefix 连续。
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        # need_size 的单位是 token slot。一次可以申请多个 page，但申请长度必须
+        # 是 page_size 的整数倍，避免产生无法独立传输/存储的半个 page。
         assert (
             need_size % self.page_size == 0
         ), "The requested size should be a multiple of the page size."
+
+        # 这里只检查空闲 slot 总数，不搜索连续的物理区间；空间不足时由调用方
+        # 决定淘汰 L2、缩短预取范围或放弃本次分配。
         if need_size > self.available_size():
             return None
 
+        # 按 free_slots 当前顺序取出 need_size 个 slot，并从空闲队列移除。
+        # 初始 free_slots 连续；发生释放和复用后，不同 page 之间可能分散。
+        # page_size > 1 时，正常调用链依靠整页申请/整页释放维持以下隐含不变量：
+        # 每组 page_size 个索引内部连续，且首索引按 page_size 对齐。
+        # 当前代码没有对这个索引形状做显式校验；page_size == 1 时自然满足。
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
 
+        # slot_used 是独立的占用位图，用于在 allocator 状态异常时尽早发现
+        # free_slots 中混入了仍在使用的 slot，防止同一位置被重复分配。
         assert not self.slot_used[select_index].any(), (
             f"Double-alloc detected: slots already allocated: "
             f"{select_index[self.slot_used[select_index]].tolist()}."
         )
+
+        # 标记这些 slot 已被当前调用占用。此时只完成地址预留，KV 数据仍需
+        # 由 L3 -> L2 预取或 L1 -> L2 write-through/write-back 写入。
         self.slot_used[select_index] = True
 
+        # 按逻辑 token 顺序返回 Host slot 索引；索引 tensor 连续不代表其指向的
+        # KV 数据在 Host Buffer 中构成一个连续的 prefix 区间。
         return select_index
 
     @synchronized

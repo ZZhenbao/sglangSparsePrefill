@@ -2283,21 +2283,47 @@ class Scheduler(
 
     def _prefetch_kvcache(self, req: Req):
         if self.enable_hicache_storage:
+            # 1. 请求进入 waiting queue 前，先匹配本地 Radix Tree，确定连续命中的
+            # L1 GPU prefix 和 L2 Host-only 后缀。本阶段只探测缓存位置，显式关闭
+            # Mamba COW，避免在尚未调度 forward 时分配并复制请求私有状态。
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
+
+            # 2. last_host_node 是本地 L2 能确认的最深缓存节点；后续 L3 查询
+            # 从该节点继续扩展。完全没有本地命中时使用 root 作为起点。
             last_host_node = req.last_host_node
+
+            # 3. L3 的 page hash 采用链式计算，因此查询起点必须有可用的
+            # L2 备份/hash，或者是没有前置 hash 的 root。
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
+                # 4. 取得锚点最后一个 page 的 hash，作为 L3 后续 page 查找的
+                # prior hash；root 没有 page，此时 last_hash 为 None。
                 last_hash = last_host_node.get_last_hash_value()
+
+                # 5. prefix_indices 只包含 L1 GPU 命中，host_hit_length 表示紧随其后
+                # 的 L2-only 命中；两者之和是本地缓存连续覆盖的 token 数。
                 matched_len = len(req.prefix_indices) + req.host_hit_length
+
+                # 6. 确定本轮允许从缓存复用的右边界。通常最多到 input_len - 1，
+                # 为 logits 计算保留最后一个输入 token；logprob 配置还可能进一步收缩。
                 match_end = req._compute_max_prefix_len(
                     len(req.full_untruncated_fill_ids)
                 )
+
+                # 7. 只把本地 L1/L2 尚未覆盖、且位于可复用范围内的连续后缀
+                # 交给 L3 查询。空后缀会由 prefetch_from_storage() 直接跳过。
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
 
+                # 8. 部分 L3 backend 需要完整的 page-hash 上下文。这里传递
+                # last_host_node 之前的祖先 hash；锚点自身的 hash 由 last_hash 单独传入。
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
+
+                # 9. 为候选 token 在 L2 Host pool 预留 slot，并异步发起 L3 -> L2
+                # 读取。调度循环随后通过 check_prefetch_progress() 等待/收割结果，
+                # 将成功读取的 token 插入 L2 Radix Tree，再重新执行一次 prefix match。
                 self.tree_cache.prefetch_from_storage(
                     req.rid,
                     last_host_node,
@@ -2306,9 +2332,23 @@ class Scheduler(
                     prefix_keys,
                 )
 
+#     新请求 Req
+#    │
+#    ├─ 校验/设置优先级
+#    │
+#    ├─ Unified 模式 ──→ HiCache Storage 预取 ──→ waiting_queue
+#    │
+#    ├─ Prefill 实例 ──→ HiCache Storage 预取 ──→ bootstrap_queue
+#    │                                             │
+#    │                                             └─ 握手完成后进入 waiting_queue
+#    │
+#    └─ Decode 实例 ──→ decode_prealloc_queue
+#                          │
+#                          └─ 预分配 KV → 接收 Prefill 节点传来的 KV
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
+        # use this
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return

@@ -1126,19 +1126,34 @@ class Req(ReqDllmMixin):
         else:
             self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
 
+    # 为请求准备“这一轮要处理的完整 token 序列”，然后在 Prefix Cache 中执行一次最长前缀匹配，并把 L1/L2 以及混合架构缓存的命中结果写回 Req。
+    # 上一轮请求状态
+    # ↓
+    # 更新本轮完整输入 token
+    # ↓
+    # 确定最多允许匹配到哪个 token
+    # ↓
+    # 在 RadixCache / HiCache 中匹配
+    # ↓
+    # 得到 L1、L2、SWA、Mamba 命中情况
+    # ↓
+    # 将结果写入 Req
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
         cow_mamba: Optional[bool] = None,
     ):
+        # 刷新本轮输入
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
         else:
+            # 普通LLM, 原始[A,B,C],生成了[D, E],刷新后: [A,B,C,D,E]
             self._refresh_fill_ids()
 
         input_len = len(self.full_untruncated_fill_ids)
 
+        # 应该不使用这个
         # Streaming sessions reuse committed KV from the session slot, so
         # custom logprob_start_len is not supported — override to -1.
         if (
@@ -1155,6 +1170,7 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
+        # 构造要匹配prefix token的最大范围,
         # Pass the full array with a raw-token cap (limit) instead of slicing,
         # avoiding an O(context) copy per prefill-batch build.
         token_ids_to_match = self.full_untruncated_fill_ids
@@ -1167,8 +1183,14 @@ class Req(ReqDllmMixin):
             key_limit = None
 
         if tree_cache is not None:
+            # 调用方未指定时，根据缓存实现自动判断是否需要 Mamba 状态的写时复制。
+            # 当前 Qwen2.5 使用普通 Attention，因此 supports_mamba() 返回 False；
+            # L3 预取阶段也会由 _prefetch_kvcache() 显式传入 False。
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
+
+            # 使用 token 序列和 extra_key 构造 Radix Tree 查询 key，执行最长前缀匹配。
+            # limit 只限制逻辑匹配范围，不会在这里复制完整 token 数组。
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(
@@ -1180,8 +1202,14 @@ class Req(ReqDllmMixin):
                     cow_mamba=cow_mamba,
                 )
             )
+
+            # 测试/调试开关：保留缓存对象和返回值的数据类型、设备信息，
+            # 同时把本次 L1/L2 命中归零并将匹配节点退回 root。
             if envs.SGLANG_RADIX_FORCE_MISS.get():
                 match_result = zero_match_result(tree_cache, match_result)
+
+            # 将统一的 MatchResult 写回 Req，供 L3 预取、L2 -> L1 load-back
+            # 以及后续 batch 构建使用
             (
                 self.prefix_indices,
                 self.last_node,
@@ -1192,23 +1220,31 @@ class Req(ReqDllmMixin):
                 self.mamba_host_hit_length,
                 self.mamba_branching_seqlen,
             ) = (
-                match_result.device_indices,
-                match_result.last_device_node,
-                match_result.last_host_node,
-                match_result.best_match_node,
-                match_result.host_hit_length,
-                match_result.swa_host_hit_length,
-                match_result.mamba_host_hit_length,
-                match_result.mamba_branching_seqlen,
-            )
+                match_result.device_indices,          # - prefix_indices：当前已驻留在 L1 GPU 的 Full KV slot；
+                match_result.last_device_node,        # - last_node：Full KV 在 L1 的匹配终点；
+                match_result.last_host_node,          # - last_host_node：L2 的匹配终点，也是 L3 预取使用的锚点；
+                match_result.best_match_node,         # - best_match_node：各缓存组件共同接受的最深节点，供 load-back 使用；
+                match_result.host_hit_length,         # - host_hit_length：只在 L2 命中的 Full KV token 数；
+                match_result.swa_host_hit_length,     # - swa_host_hit_length：只在 L2 命中的 SWA token 数；   
+                match_result.mamba_host_hit_length,   # - mamba_host_hit_length：只在 L2 命中的 Mamba 状态槽数量；   
+                match_result.mamba_branching_seqlen,  # - mamba_branching_seqlen：Mamba 可复用状态对应的分支位置。       
+            )               
+
+            # 记录已经由缓存树持有并受保护的 KV 边界，供后续插入、淘汰和释放
+            # KV slot 时使用。普通 Radix/HiCache 默认等于当前 L1 命中长度；
+            # 特殊缓存实现可以在 MatchResult 中返回更精确的边界。
             if match_result.cache_protected_len is not None:
                 self.cache_protected_len = match_result.cache_protected_len
             else:
                 self.cache_protected_len = len(self.prefix_indices)
 
+            # DLLM 根据新的 prefix 命中位置更新 block 偏移；当前 Qwen2.5 路径不进入。
             if self.is_dllm():
                 self._update_block_offset_for_dllm()
 
+        # 请求被调度器回退后，full token 序列已经包含先前生成的 output_ids。
+        # 多模态请求需要为这些纯文本输出补齐三维 MRoPE position，保证重新 prefill
+        # 时的位置长度与 token 长度一致；普通文本请求不会进入该分支。
         if (
             self.is_retracted
             and self.multimodal_inputs is not None

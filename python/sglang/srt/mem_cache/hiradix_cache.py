@@ -1198,38 +1198,65 @@ class HiRadixCache(RadixCache):
         self._update_leaf_status(root.parent)
         self._update_host_leaf_status(root.parent)
         return freed_device
-
+    # TODO： Sparse Attention
     def evict_host(self, num_tokens: int):
+        # evictable_host_leaves 保存当前可以从 L2 淘汰的 Host 层叶子候选。
+        # 按维护约定，这些节点已经失去 L1 GPU value、未被请求锁定，且没有
+        # 仍驻留 L2 的子节点。先复制快照，避免遍历时直接修改原集合。
         leaves = list(self.evictable_host_leaves)
+
+        # 使用当前配置的淘汰策略（LRU/LFU/FIFO/priority 等）为候选排序。
+        # Python 最小堆会优先弹出 get_priority() 返回值最小的节点。
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
         ]
         heapq.heapify(eviction_heap)
 
+        # num_tokens 是希望释放的 L2 token slot 数。节点以整段/page 为单位
+        # 淘汰，因此最终释放量可能略大于目标；候选不足时也可能小于目标。
         num_evicted = 0
         while num_evicted < num_tokens and len(eviction_heap):
             _, x = heapq.heappop(eviction_heap)
+
+            # root 表示空前缀，不承载可释放的普通 Host KV，也不能从树中删除。
             if x == self.root_node:
                 break
-            # only evict the host value of evicted nodes
+
+            # 候选快照创建后节点状态可能已经变化，因此再次确认其 L1 value
+            # 已被淘汰。仍有 GPU KV 的节点保留 L2 备份，不在这里释放。
             if not x.evicted:
                 continue
 
+            # host_ref_counter 保护正在被 L3 prefetch、storage write 等异步操作
+            # 使用的 Host 节点；引用未释放时跳过，避免释放仍在访问的 slot。
             if x.host_ref_counter > 0:
                 continue
 
-            # Block deleted entirely (GPU already evicted, now CPU freed) --
-            # emit remove(CPU) so the router drops the host-tier entry.
+            # 此时节点的 L1 GPU KV 已不存在，再释放 host_value 后本地 L1/L2
+            # 都无法复用该节点。先发送 CPU remove 事件，让外部 router/索引
+            # 删除 Host 层记录；L3 File/SSD 中已经持久化的数据不在这里删除。
             self._record_remove_event(x, medium=StorageMedium.CPU)
+
+            # 将 x.host_value 中记录的 L2 slot 归还 Host KV Pool。
+            # evict_host() 返回实际释放的 token slot 数，用于累计淘汰进度。
             num_evicted += self.cache_controller.evict_host(x.host_value)
 
+            # x.key 的第一个 page 是它在 parent.children 中使用的字典 key。
+            # L1/L2 均已释放后，将整个节点从本地 Radix Tree 路径中摘除。
             key = x.key.child_key(self.page_size)
             v = x.parent.children.pop(key, None)
+
+            # 确认删除的正是目标节点，防止 children 索引与树结构不一致。
             assert v == x, f"parent does not have child key, {key}"
+
+            # 同步维护 Host 叶子候选集合，并重新判断父节点是否成为新候选。
             if x in self.evictable_host_leaves:
                 self.evictable_host_leaves.remove(x)
             self._update_host_leaf_status(x.parent)
 
+            # 删除最后一个子节点后，如果父节点自身也已离开 L1，它就成为新的
+            # Host 叶子。当前 heap 来自旧快照，需要显式加入，才能在本轮继续
+            # 自叶向根释放 L2；下一次弹到 root 时会由上面的保护条件停止。
             if len(x.parent.children) == 0 and x.parent.evicted:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
@@ -1549,30 +1576,67 @@ class HiRadixCache(RadixCache):
         """
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
+    # 请求 token
+    # ↓
+    # 按 Radix Tree 匹配最长前缀
+    # ↓
+    # ├─ 收集仍在 GPU 的节点 value
+    # ├─ 统计只在 Host 的连续后缀
+    # └─ 分别确定 GPU 和 Host 的匹配边界
+
+    # 得到：
+    # L1 GPU 中可直接复用的 KV slot；
+    # L2 Host 中额外命中的 KV 长度；
+    # GPU 命中的终点节点；
+    # Host 命中的终点节点。
+    # Sparse Attention 关注点：这里先生成分层命中结果；Host 命中的 KV 会在
+    # 调度阶段 load back 到 GPU 并追加到 req.prefix_indices，之后才进入 sparse prefill。
     def match_prefix(self, params: MatchPrefixParams):
         if self.disable:
             return self._empty_match_result
-
+        # 处理查询 Key，在遍历 Radix Tree 前把请求的缓存 Key 规范化。
+        # token_ids：原始 token 序列
+        # extra_key：LoRA、cache salt 等隔离标识
+        # limit：最多允许匹配到的位置，通常是 input_len - 1
         key = params.key
+        # 为 EAGLE 推测解码调整缓存 key；当前方案没有启用 EAGLE。
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
+        # 将允许匹配的长度向下对齐到完整 KV page；尾部未对齐的 token
+        # 不参与缓存匹配，交给本轮 prefill 重新计算。
         key = key.page_aligned(self.page_size)
+
         if len(key) == 0:
             return self._empty_match_result
 
+        # 从根节点开始匹配最长前缀：
+        # value 收集匹配路径中仍驻留在 L1 GPU 的 KV slot；
+        # last_node 指向 Radix Tree 中逻辑匹配到的最深节点，它可能只驻留在 L2 Host。
         value, last_node = self._match_prefix_helper(self.root_node, key)
+
+        # 每个树节点分别保存一段 KV slot，将这些分段按 prefix 顺序拼成连续的一维索引。
+        # 没有 L1 命中时返回位于正确设备上的空 tensor。
         if value:
             value = torch.cat(value)
         else:
             value = self._empty_match_result.device_indices
 
+        # 从逻辑匹配终点向根方向回溯连续的 L2-only 后缀。
+        # evicted 表示该节点的 KV 已离开 L1；host_value 保存其 L2 slot。
+        # 回溯结束后的 last_node 是最深的 L1 GPU 驻留节点。
         host_hit_length = 0
         last_host_node = last_node
         while last_node.evicted:
             host_hit_length += len(last_node.host_value)
             last_node = last_node.parent
+
+        # 从逻辑匹配终点寻找最深的 L2 已备份节点。
+        # 该节点既是 Host 命中边界，也是后续 L3 查询与 L2 -> L1 load-back 的锚点。
         while not last_host_node.backuped:
             last_host_node = last_host_node.parent
 
+        # device_indices 仅包含当前可直接访问的 L1 KV slot。
+        # host_hit_length 描述还需从 L2 搬回 L1 的 prefix token 数。
+        # 调度器完成 load-back 后会把新分配的 GPU slot 追加到 req.prefix_indices。
         return MatchResult(
             device_indices=value,
             last_device_node=last_node,
@@ -1582,6 +1646,7 @@ class HiRadixCache(RadixCache):
             host_hit_length=host_hit_length,
         )
 
+    # TODO: Sparse prefill 需要关注
     def prefetch_from_storage(
         self,
         req_id: str,
@@ -1590,14 +1655,24 @@ class HiRadixCache(RadixCache):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
     ):
+        # 根据 L1/L2 未命中的连续 token 后缀构造 L3 查询 key：
+        # - extra_key 沿用锚点所在的缓存命名空间，避免跨 LoRA/cache salt 复用；
+        # - EAGLE 模式使用 bigram key；当前 Qwen2.5 路径使用普通 token key；
+        # - last_hash 不放入 RadixKey，稍后由 controller 用它续接 page-hash 链。
         prefetch_key = RadixKey(
             new_input_tokens,
             extra_key=last_host_node.key.extra_key,
             is_bigram=self.is_eagle,
         )
-        # align the number of fetching tokens to the page size
+
+        # L3 以完整 page 为查询和传输单位，向下截掉末尾不完整的 page。
         prefetch_key = prefetch_key.page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
+
+        # 以下任一条件成立时不提交 L3 预取：
+        # 1. storage backend 未启用；
+        # 2. 候选长度小于预取收益阈值；
+        # 3. 正在预取的 token 已占满预留的 L2 容量，触发限流。
         if (
             not self.enable_storage
             or prefetch_length < self.prefetch_threshold
@@ -1605,26 +1680,45 @@ class HiRadixCache(RadixCache):
         ):
             return
 
+        # 异步预取完成前保护 L2 锚点，防止 Host 淘汰破坏后续 Radix Tree
+        # 插入位置及 page-hash 上下文。成功或终止后由完成路径释放该引用。
         last_host_node.protect_host()
+
+        # 先为计划从 L3 读取的全部 token 在 L2 Host pool 中预留目标 slot。
+        # 此时只完成空间分配，KV 数据仍在 L3。
         host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+
+        # L2 空间不足时，先淘汰可淘汰的 Host KV，再尝试一次完整长度分配。
         if host_indices is None:
             self.evict_host(prefetch_length)
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+
+        # 完整长度仍无法分配时，退化为当前 L2 可容纳的最大 page 对齐前缀。
         if host_indices is None:
             available_size = self.cache_controller.mem_pool_host.available_size()
             prefetch_length = available_size - (available_size % self.page_size)
+
+            # 缩短后的范围仍需达到预取阈值，否则收益不足，释放锚点后放弃。
             if prefetch_length >= self.prefetch_threshold:
                 prefetch_key = prefetch_key[:prefetch_length]
                 host_indices = self.cache_controller.mem_pool_host.alloc(
                     prefetch_length
                 )
+
+                # 可用量可能在检查和实际分配之间发生变化；最终分配失败时
+                # 必须释放此前对 L2 锚点持有的保护引用。
                 if host_indices is None:
                     last_host_node.release_host()
                     return
             else:
                 last_host_node.release_host()
-                # no sufficient host memory for prefetch
                 return
+
+        # 将 L3 查询/读取任务提交给后台线程。controller 会：
+        # 1. 使用 last_hash 和 prefetch_key 计算连续的 page hash；
+        # 2. 查询 File/SSD backend 中最长连续命中；
+        # 3. 把命中的 page 写入刚才预留的 L2 host_indices。
+        # prefix_keys 仅供需要完整祖先 hash 上下文的 backend 使用；当前 File backend 忽略。
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,
@@ -1633,12 +1727,18 @@ class HiRadixCache(RadixCache):
             prefix_keys,
             **self._get_extra_pools(),
         )
+
+        # 保存主线程收割异步结果所需的上下文。check_prefetch_progress()
+        # 会使用这些信息把成功读取的 L2 slot 插入 Host Radix Tree，并释放锚点。
         self.ongoing_prefetch[req_id] = (
             last_host_node,
             prefetch_key,
             host_indices,
             operation,
         )
+
+        # 统计被在途预取占用的 L2 token 数，后续预取用它进行容量限流；
+        # 完成或撤销该 operation 时会对应扣减。
         self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
 
     def _insert_helper_host(
@@ -1683,31 +1783,53 @@ class HiRadixCache(RadixCache):
             self._record_store_event(new_node, medium=StorageMedium.CPU)
 
         return matched_length
-
+    # new_node.value 保存的是：new_node.key 对应的 L1 GPU KV Cache slot 索引。
+    # key 是一个 RadixKey 对象，表示请求中“仍等待匹配”的 token 序列。
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
+        # 从传入节点（正常情况下为 root）开始匹配，并刷新其 LRU 访问时间。
         node.last_access_time = time.monotonic()
+
+        # Radix Tree 的 children 使用 key 的第一个完整 page 作为索引，
+        # 先用它定位可能包含当前 prefix 的子节点，避免遍历全部 children。
         child_key = key.child_key(self.page_size)
+
+        # 按匹配顺序保存仍驻留在 L1 GPU 的各段 KV slot。
+        # L2-only 节点仍参与树路径匹配，但它们的 value 不会加入该列表。
         value = []
 
+        # 每轮匹配一个 Radix Tree 节点：key 非空且存在对应分支时继续向下。
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
+
+            # 比较 child.key 与剩余请求 key，得到按 page 对齐的公共前缀长度。
             prefix_len = child.key.match(key, page_size=self.page_size)
+
+            # 请求只匹配到 child.key 的中间位置，需要在公共前缀边界分裂节点：
+            # parent -> child 会变成 parent -> new_node -> 原 child 的剩余部分。
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
+
+                # new_node 是本次逻辑匹配终点；其 KV 仍在 L1 时记录 GPU slot。
                 if not new_node.evicted:
                     value.append(new_node.value)
                 node = new_node
                 break
             else:
+                # child.key 被完整匹配。仅收集仍驻留在 L1 的 KV slot；
+                # 已从 L1 淘汰但仍在 L2 的节点只推进逻辑匹配位置。
                 if not child.evicted:
                     value.append(child.value)
                 node = child
+
+                # 消耗已经匹配的部分，继续使用剩余 key 向下一层查找。
                 key = key[prefix_len:]
 
                 if len(key):
                     child_key = key.child_key(self.page_size)
 
+        # value：沿匹配路径收集的 L1 GPU KV slot 分段；
+        # node：Radix Tree 中逻辑最长匹配的终点，可能驻留在 L1，也可能只驻留在 L2。
         return value, node
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):

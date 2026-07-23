@@ -991,44 +991,100 @@ class HiCacheController:
         return False
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        """查询 L3 中从本地锚点开始的最长连续 page 命中，不读取实际 KV。"""
+
+        # last_hash 是 L1/L2 本地命中终点的最后一个 page hash；没有本地
+        # prefix 时为 None，后续 page hash 将从空链开始计算。
         last_hash = operation.last_hash
+
+        # token_ids 保存本地 L1/L2 尚未覆盖、准备查询 L3 的 page 对齐后缀。
+        # 当前调用中它实际可以是 RadixKey，但支持 len/迭代，能直接参与 hash 计算。
         tokens_to_fetch = operation.token_ids
+
+        # 某些 backend 需要完整祖先 hash 上下文。使用副本是为了在分批查询时
+        # 追加本批 hash，而不修改 operation 中保存的原始元数据；File backend 忽略它。
         prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
 
+        # storage_query_count 以 token slot 为单位累计连续命中长度；
+        # hash_value 保存对应的 page hash 字符串，不包含任何 KV 数据。
         storage_query_count = 0
         hash_value = []
+
+        # 按 page_size 将待查询 token 分组，并从 last_hash 开始计算链式 hash。
+        # 返回列表中每个元素对应一个 page，后一个 page hash 依赖前一个 page hash。
         page_hashes = self.get_hash_str(
             tokens_to_fetch, last_hash, page_size=self.page_size
         )
 
+        # page 数量可能很大，按 STORAGE_BATCH_SIZE 分批向 storage backend
+        # 查询文件/key 是否存在，避免一次提交过大的 exists 请求。
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
             batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
+
+            # 可选 backend 元数据。当前 File/SSD backend 只按 page hash 查文件，
+            # 不读取 prefix_keys；需要层级上下文的 backend 可以使用它。
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+
+            # batch_exists() 返回当前 batch 从第一个 hash 开始连续存在的 page 数。
+            # 例如 [存在, 存在, 缺失, 存在] 返回 2，不会跨过中间缺页。
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+
+            # 只保留本批连续命中的 page hash，并把 page 数转换为 token slot 数。
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
+
+            # 当前 batch 没有全部命中，说明连续 prefix 在第一个缺页处结束；
+            # 后续 page 即使单独存在，也不能作为当前请求的连续 L3 prefix 复用。
             if hit_page_num < len(batch_hashes):
                 break
+
+            # 完整命中本批后，为需要完整 hash 链的 backend 补充上下文，
+            # 供下一批 exists 查询使用。当前 File backend 默认不会进入该分支。
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
 
+        # hash_value：最长连续命中的 page hash 列表（长度单位为 page）；
+        # storage_query_count：同一命中范围覆盖的 token slot 数。
         return hash_value, storage_query_count
 
     def prefetch_thread_func(self):
         """
-        Manage prefetching operations from storage backend to host memory.
+        查询每个预取任务在 L3 中的最长连续命中，并把通过收益检查的任务
+        裁剪后交给独立 I/O 线程执行实际的 L3 -> L2 读取。
+        TODO: sparse prefill需要看
+        本线程负责 hash/exists 查询和任务规划，不直接读取 KV 数据。
         """
+        # prefetch_buffer 是“命中查询线程 -> 实际 I/O 线程”的中间队列。
+        # 只有确认达到 prefetch_threshold 的 operation 才会进入该队列。
         self.prefetch_buffer = Queue()
+
+        # 启动第二个 daemon 线程。prefetch_io_aux_func() 从 prefetch_buffer
+        # 取任务，并通过 _page_transfer() 调用 storage backend 读取 SSD page。
         self.prefetch_io_aux_thread = threading.Thread(
             target=self.prefetch_io_aux_func, daemon=True
         )
         self.prefetch_io_aux_thread.start()
+
+        # 正常运行时持续接收任务；收到停止信号后仍处理完已经进入
+        # prefetch_queue 的查询任务，再退出本线程。
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
+                # 最多阻塞 1 秒，以便队列暂时为空时周期性重新检查停止信号。
                 operation = self.prefetch_queue.get(block=True, timeout=1)
+
+                # None 是停止/唤醒线程使用的哨兵，不对应真实请求。
                 if operation is None:
                     continue
+
+                # 根据 operation.last_hash 和待查询 token 生成链式 page hash，
+                # 再向 L3 backend 查询从第一个 page 开始的最长连续命中：
+                # - hash_value：实际连续命中的 page hash 列表；
+                # - storage_hit_count：命中的 token slot 数，而非 page 数。
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
+
+                # TP/CP 各 rank 分别保存同一 page 的不同 KV 分片。只有所有相关
+                # rank 都命中的连续前缀才能复用，因此通过 MIN 取共同命中长度。
+                # 当前 TP=1、CP=1 时，该 all-reduce 不会改变数值。
                 storage_hit_count_tensor = torch.tensor(
                     storage_hit_count, dtype=torch.int
                 )
@@ -1037,18 +1093,25 @@ class HiCacheController:
                 )
                 storage_hit_count = storage_hit_count_tensor.item()
 
+                # 共同命中长度不足收益阈值时撤销任务：
+                # - request_id 进入 revoke queue，由主线程清理 ongoing_prefetch
+                #   并释放 last_host_node 的保护引用；
+                # - 所有预分配的 L2 Host slot 进入延迟释放队列。
                 if storage_hit_count < self.prefetch_threshold:
-                    # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
                     self.append_host_mem_release(operation.host_indices)
                     logger.debug(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
                 else:
+                    # storage_hit_count 使用 token 为单位；除以 page_size 得到共同
+                    # 命中的 page 数，并将本 rank 的 hash 列表裁剪到该范围。
                     operation.hash_value = hash_value[
                         : (storage_hit_count // self.page_size)
                     ]
-                    # free the pre-allocated memory for pages that are not hit
+
+                    # host_indices 最初为完整候选范围预留。将共同命中范围之后的
+                    # L2 slot 送入释放队列，只把真正要读取的前缀保留给 operation。
                     self.append_host_mem_release(
                         operation.host_indices[storage_hit_count:]
                     )
@@ -1056,8 +1119,12 @@ class HiCacheController:
                     logger.debug(
                         f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
                     )
+
+                    # 交给 I/O 线程执行实际 File/SSD page 读取。该线程完成写入后
+                    # 会逐 page 增加 operation.completed_tokens，供 scheduler 轮询。
                     self.prefetch_buffer.put(operation)
 
+            # timeout 只表示这一秒内没有新任务，属于正常空闲状态。
             except Empty:
                 continue
 
