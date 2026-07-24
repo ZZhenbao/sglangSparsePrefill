@@ -2798,29 +2798,56 @@ class Scheduler(
             prefill_delayer_single_pass.finalize(actual_prefill=ret is not None)
 
         return ret
-
+    # TODO: Sparse Prefill 需要关注
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
+        # 函数整体作用：为当前调度轮次准备一个新的 prefill batch。
+        # 它读取 waiting_queue、running_batch 和各级缓存的运行状态，依次完成：
+        #   1. 收割 HiCache 后台事件并检查请求的 L3 -> L2 预取进度；
+        #   2. 检查请求槽、GPU KV、prefill token 等资源预算；
+        #   3. 对预取完成的请求重新匹配 L1/L2，并按需提交 L2 -> L1 load-back； (重点关注这个)
+        #   4. 将获准运行的请求移出 waiting_queue，构造并准备 ScheduleBatch。
+        # 有可执行请求时返回 ScheduleBatch；没有请求通过上述检查时返回 None，
+        # 请求继续留在 waiting_queue，等待后续调度轮次再次处理。
+        # max_running_requests=1 时，返回的 prefill batch 最多包含一个请求。
+        #
+        # 阅读标记：
+        #   [主线] 与单请求 Sparse Prefill + HiCache 的缓存恢复和 batch 构造有关；
+        #   [当前可跳过] 属于当前启动参数未启用的附加功能。
+
+        # [当前可跳过] 仅用于 json_schema/regex/EBNF/structural_tag 受约束生成。
+        # 普通文本生成不会进入 grammar_queue。
+        # grammar 准备完成的请求会重新经过统一的入队流程；如果启用了 L3，
+        # _add_request_to_queue() 也会在这里为这些请求提交 storage prefetch。
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
+        # [主线] 收割已经完成的 HiCache 控制事件，包括 L1/L2 搬运完成通知、
+        # L3 预取撤销以及延迟释放的 Host slot。某个请求的 L3 读取进度
+        # 会在遍历 waiting_queue 时由 check_prefetch_progress() 单独检查。
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
 
+        # [当前可跳过] 当前未启用 priority preemption，Qwen2.5 也不是 hybrid SWA。
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
+        # [主线] 没有等待请求，或运行 batch 已满时，本轮无法创建 prefill batch。
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
             return None
 
+        # running_bs 统计已经进入执行阶段的请求。max_running_requests=1 时，
+        # batch N 仍在运行会占用唯一槽位；batch N+1 保留在 waiting_queue，
+        # 已提交的 L3 -> L2 后台读取仍可继续推进。
         running_bs = len(self.running_batch.reqs)
+        # [当前可跳过] 只有配置了 min-free-slots delay 时才会进入。
         # Skipped during a chunked prefill: that pass must proceed regardless.
         if (
             self.min_free_slots_delayer is not None
@@ -2832,6 +2859,9 @@ class Scheduler(
         ):
             return None
 
+        # [主线] max_running_requests=1 时重点看可分配请求数是否为 0。
+        # 当前关闭 chunked prefill 且未启用 priority preemption，判断可以简化理解为：
+        # get_num_allocatable_reqs(running_bs) <= 0 时让 batch N+1 继续等待。
         # Ignore the check if self.chunked_req is not None.
         # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
         # as the space for the chunked requests has just been released.
@@ -2842,18 +2872,24 @@ class Scheduler(
             and self.chunked_req is None
             and not self.enable_priority_preemption
         ):
+            # 没有请求槽时，本轮不构造新 prefill batch。后续调度轮次会在
+            # batch N 释放槽位后再次检查 waiting_queue 中的 batch N+1。
             self.running_batch.batch_is_full = True
             return None
 
+        # [主线，暂时无需深入实现] 对等待队列排序。单请求 batch 中它通常不改变本轮请求数量，仍负责
+        # 应用配置的调度策略并确定遍历顺序。
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
 
+        # [当前可跳过] 仅供 TEST_RETRACT 测试开关使用。
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
             # in the waiting queue.
             return None
 
+        # [当前可跳过] 当前使用 --chunked-prefill-size -1，不会形成 chunked_req。
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
         if self.chunked_req is not None and self.enable_dynamic_chunking:
@@ -2862,29 +2898,34 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
+        # [主线] PrefillAdder 维护本轮的请求槽、GPU KV token 和 prefill token 预算。
+        # 后面的 add_one_req() 也会在发现 L2 Host 命中时调用 init_load_back()。
+        # 当前先掌握它保存预算并提供 add_one_req() 即可，无需逐项追构造参数。
         # Prefill policy
         adder = PrefillAdder(
-            self.page_size,
-            self.tree_cache,
-            self.token_to_kv_pool_allocator,
-            self.running_batch,
-            self.new_token_ratio_tracker.current,
-            self.max_prefill_tokens,
-            chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
-            self.priority_scheduling_preemption_threshold,
-            max_prefill_bs=self.max_prefill_bs,
-            max_running_requests=self.max_running_requests,
-            prefill_max_requests=self.server_args.prefill_max_requests,
-            prefill_delayer_single_pass=prefill_delayer_single_pass,
-            dllm_config=self.dllm_config,
-            waiting_queue_len=len(self.waiting_queue),
+            self.page_size,  # KV cache page 的 token 数，也是分配与预算的对齐单位
+            self.tree_cache,  # Prefix Cache；当前为 HiRadixCache，提供淘汰和 load-back
+            self.token_to_kv_pool_allocator,  # L1 GPU KV slot 分配器
+            self.running_batch,  # 已运行请求，用于估算其后续 decode KV 预留量
+            self.new_token_ratio_tracker.current,  # 当前 decode 新 token 预留比例
+            self.max_prefill_tokens,  # 本轮最多允许处理的 prefill token 预算
+            chunked_prefill_size,  # Chunked Prefill token 预算；关闭时为 None
+            running_bs if self.is_mixed_chunk else 0,  # 混合 batch 中同时执行的 decode token 数
+            self.priority_scheduling_preemption_threshold,  # priority preemption 的触发阈值
+            max_prefill_bs=self.max_prefill_bs,  # 已观测到的最大 prefill batch size
+            max_running_requests=self.max_running_requests,  # 最大并发运行请求数
+            prefill_max_requests=self.server_args.prefill_max_requests,  # 单个 prefill batch 的可选请求数上限
+            prefill_delayer_single_pass=prefill_delayer_single_pass,  # 本轮 Prefill Delayer 决策器
+            dllm_config=self.dllm_config,  # Diffusion LLM 配置及其专用 token 预算
+            waiting_queue_len=len(self.waiting_queue),  # 本轮开始时 waiting_queue 的长度快照
         )
 
+        # [当前可跳过] chunked prefill 请求的续接处理。
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
+        # [当前可跳过] 当前没有启用 LoRA。
         if self.enable_lora:
             running_loras = {
                 req.lora_id for req in self.running_batch.reqs if not req.finished()
@@ -2898,17 +2939,25 @@ class Scheduler(
                     self.running_batch.reqs,
                 )
 
+        # [当前可跳过] Qwen2.5 是普通 Attention 模型，没有 Mamba 状态池。
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
+
+        # 按调度顺序尝试把 waiting request 加入本轮 prefill batch。
+        # max_running_requests=1 时，第一个成功加入的请求会占满本轮容量，
+        # 因此 can_run_list 最终为空或只包含一个请求。
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            # [当前可跳过] LoRA adapter 的准入检查。
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
+            # [主线] 单请求模式下检查本轮是否已经选入一个请求。
             running_bs = len(self.running_batch.reqs)
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 self.running_batch.batch_is_full = True
+            # [当前可跳过] 仅用于 Prefill/Decode 分离部署；当前为 NULL 模式。
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
@@ -2916,32 +2965,49 @@ class Scheduler(
                     self.running_batch.batch_is_full = True
 
             if self.running_batch.batch_is_full:
+                # [当前可跳过 preempt_to_schedule] 当前未启用 priority preemption，
+                # batch 满时会直接 break，剩余请求继续等待。
                 if (
                     not self.enable_priority_preemption
                     or not adder.preempt_to_schedule(req, self.server_args)
                 ):
                     break
 
+            # [主线] 检查请求入队时提交的 L3 -> L2 任务。
             if self.enable_hicache_storage:
+                # _prefetch_kvcache() 已在请求入队时提交 L3 -> L2 任务。
+                # 这里位于消费端：wait_complete 策略下，只有所有已确认命中的
+                # L3 page 都写入 L2 后才返回 True；未完成的请求留在 waiting_queue。
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
+                # check_prefetch_progress() 已把读回的 Host slot 插入 L2 Radix Tree。
+                # 保存本次实际来自 L3 的 token 数，供请求统计和返回元数据使用。
                 # Pop the number of tokens loaded from storage (L3 hits)
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
                     req.rid
                 )
 
+            # [主线] L3 数据登记到 L2 后重新执行 prefix match。此次结果会同时写回：
+            # prefix_indices（L1 命中）和 host_hit_length（仍需搬回 GPU 的 L2 命中）。
             req.init_next_round_input(self.tree_cache)
+
+            # [主线] 对当前请求做最终资源准入。若 host_hit_length > 0，add_one_req()
+            # 会调用 tree_cache.init_load_back()，预留 GPU slot 并把 L2 -> L1
+            # 搬运加入 CacheController 的 load_queue；实际 DMA 在稍后统一启动。
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
 
+            # [当前可跳过] LoRA batch 状态维护。
             if self.enable_lora:
                 running_loras.add(req.lora_id)
 
+            # [主线只需知道结果] CONTINUE 表示还可尝试下一个请求；其他结果会
+            # 结束本轮选取。下面大部分代码负责资源不足和 Mamba 状态清理。
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
@@ -2951,6 +3017,7 @@ class Scheduler(
                         ) > 0 or (not self.running_batch.is_empty())
                     else:
                         self.running_batch.batch_is_full = True
+                # [当前可跳过] 以下是 Mamba 请求未成功加入 batch 时的回滚。
                 # revert matched mamba idx to avoid memory leak, if req is not added.
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
@@ -2970,20 +3037,27 @@ class Scheduler(
                         req.mamba_pool_idx = None
                 break
 
+        # [当前可跳过] 与上面的 Mamba 批量分配起点配对。
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
 
+        # [主线] can_run_list 是本轮已经通过缓存恢复和资源检查的请求集合。
+        # 它为空通常表示预取仍在进行、候选被调度条件跳过，或资源预算不足。
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None
 
+        # [主线] 只移除本轮真正获准运行的请求；仍在 L3 预取或未通过资源检查的
+        # 请求继续保留在 waiting_queue，等待下一次调度。
         can_run_set = set(can_run_list)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+        # [当前可跳过] 只有 priority preemption 产生被抢占请求时才有内容。
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
+        # [当前可跳过] 以下两个分支维护 chunked prefill 状态。
         if adder.new_chunked_req is not None:
             # Update chunked prefill
             assert self.chunked_req is None
@@ -2994,35 +3068,46 @@ class Scheduler(
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
+        # [主线] 将获准运行的 Req 封装为 ScheduleBatch。这里只建立调度容器，
+        # forward 输入和本轮新 KV slot 会在 prepare_for_extend() 中准备。
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
-            can_run_list,
-            self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
-            self.tree_cache,
-            self.model_config,
-            self.enable_overlap,
-            self.spec_algorithm,
-            chunked_req=self.chunked_req,
+            can_run_list,  # 本轮已通过资源检查、准备执行 prefill 的 Req 列表
+            self.req_to_token_pool,  # 请求位置到 KV slot 的映射表及请求槽管理器
+            self.token_to_kv_pool_allocator,  # L1 GPU KV 物理 slot 分配器
+            self.tree_cache,  # Prefix Cache；当前为 HiRadixCache
+            self.model_config,  # 模型结构、上下文长度和词表等静态配置
+            self.enable_overlap,  # 是否启用调度与 forward 重叠；当前为 False
+            self.spec_algorithm,  # Speculative Decoding 算法；当前未启用
+            chunked_req=self.chunked_req,  # 正在续接的 Chunked Prefill 请求；当前为 None
         )
 
+        # [当前可跳过] 当前没有 chunked_req，该值固定为 True。
         new_batch.contains_last_prefill_chunk = (
             self.chunked_req is None or len(can_run_list) != 1
         )
 
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
+        # [主线] 启动此前由 add_one_req() 排入队列的 L2 -> L1 搬运。
         if self.enable_hierarchical_cache:
+            # add_one_req() 只把 L2 -> L1 操作加入 load_queue；这里在独立
+            # load stream 上真正启动逐层 Host -> GPU 搬运，并返回 consumer index。
+            # forward 会用该 index 等待当前层 KV 就绪后再读取对应的 GPU slot。
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )
 
+        # [主线] 根据重新匹配后的 prefix_indices 构造 extend 输入，分配 suffix KV slot，
+        # 并生成本轮 forward 所需的长度、索引及采样元数据。
         new_batch.prepare_for_extend()
 
+        # [当前可跳过] 仅用于带 sliding-window attention 的模型。
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
                 req.swa_evict_floor = req.extend_range.end
 
+        # [当前可跳过] 只记录 prefill 统计信息，不改变缓存恢复与 forward 路径。
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder,
@@ -3037,6 +3122,7 @@ class Scheduler(
             ),
         )
 
+        # [当前可跳过] 当前关闭 chunked prefill，也不会混合 prefill/decode batch。
         # Mixed-style chunked prefill
         if (
             self.is_mixed_chunk
@@ -3057,6 +3143,7 @@ class Scheduler(
         else:
             new_batch.decoding_reqs = None
 
+        # [主线] 返回值随后交给 scheduler.run_batch() 执行 forward。
         return new_batch
 
     def _can_schedule_lora_req(

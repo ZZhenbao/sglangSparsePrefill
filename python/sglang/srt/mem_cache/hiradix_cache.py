@@ -965,22 +965,44 @@ class HiRadixCache(RadixCache):
             finish_count -= 1
 
     def loading_check(self):
+        # 函数整体作用：收割已经完成的 L2 Host -> L1 GPU load-back 操作。
+        # load-back 由 ready_to_load_host_cache() / CacheController.start_loading()
+        # 提前提交到独立 load stream；这里不发起数据搬运，只消费完成事件，
+        # 清理 ongoing_load_back，并释放搬运期间对 Radix Tree 节点的临时保护。
+
+        # 统计 ack_load_queue 队首连续完成的 load 批次数量。
+        # finish_event.query() 只做非阻塞检查；遇到第一个未完成事件立即停止，
+        # 保证后面按提交顺序从队首弹出 ack。
         finish_count = 0
         if self.pp_rank == 0:
             for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
                 if not finish_event.query():
                     break
                 finish_count += 1
+
+        # 让参与同一次 HiCache 搬运的 rank 对本轮可消费数量达成一致。
+        # TP/Attention rank 使用 MIN，避免某个 rank 提前释放共享节点状态；
+        # PP rank 使用 PP 同步获得相同计数。当前 TP=1、PP=1 时数值不变。
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
         finish_count = finish_count_tensor.item()
 
+        # finish_count=0 表示当前没有可收割的 load-back，本函数直接结束。
         if finish_count > 0:
             logger.debug(f"Process {finish_count} load operations")
+
+        # 逐个消费已经统一确认完成的 ack。一次 ack 可能由多个 load 操作合并而成，
+        # ack_list 保存这批操作对应的 Radix Tree 终点 node id。
         while finish_count > 0:
             _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
+
+            # 等待本 rank 的最后一层 Host -> GPU copy 完成。前面的 query/all-reduce
+            # 已确认该 ack 可消费；这里同时建立完整的完成与内存可见性保证。
             finish_event.synchronize()
             for ack_id in ack_list:
+                # load_back() 提交搬运时以 node id 记录并临时锁住终点节点。
+                # 完成后删除在途记录并减去这份临时锁；已加载到 L1 的 KV
+                # 和请求自身持有的缓存引用仍按各自生命周期保留。
                 end_node = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(end_node)
             finish_count -= 1
@@ -1260,45 +1282,87 @@ class HiRadixCache(RadixCache):
             if len(x.parent.children) == 0 and x.parent.evicted:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
-
+    # TODO Sparse prefill需要关注
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
+        # 函数整体作用：把以 node 为终点的一段连续 L2-only prefix 恢复到 L1。
+        # 本函数会回溯得到待恢复节点、检查收益与容量、分配 L1 GPU slot、
+        # 将 L2 -> L1 映射加入 CacheController.load_queue，并立即更新树中的
+        # slot 元数据。实际逐层 KV copy 在后续 start_loading() 中启动。
+        # 成功返回新分配的 L1 slot 索引；跳过或失败返回 None。
 
+        # 只用于 load-back 延迟和 token 数统计，不参与调度决策。
         start_time = time.perf_counter()
+
+        # 保存调用时的 L2 最深命中节点。后面的 node 会沿 parent 向 L1 回溯，
+        # last_hit_node 始终保留本次计划恢复后的逻辑终点及 ack 查找键。
         last_hit_node = node
+
+        # 按 prefix 的逻辑顺序保存需要从 L2 恢复的连续 Radix Tree 节点。
         nodes_to_load = []
+
+        # evicted 表示 node.value is None，即 KV 已离开 L1；节点仍在树中。
+        # 从最深 L2 节点向上回溯，直到遇到第一个仍有 L1 value 的祖先。
         while node.evicted:
+            # L1 已淘汰的有效命中节点必须仍有 host_value；否则没有可恢复的
+            # L2 KV，说明 Radix Tree 的分层状态已经不一致。
             assert (
                 node.backuped
             ), "No backup available on evicted nodes, should not happen"
+
+            # 从叶向根回溯时插到列表头部，最终顺序保持为：
+            # 最近 L1 祖先的子节点 -> ... -> last_hit_node。
             nodes_to_load.insert(0, node)
             node = node.parent
         else:
+            # 第一个未被 L1 淘汰的节点，是 L2-only 连续段之前的 L1 锚点。
             ancester_node = node
 
+        # 临时保护 L1 锚点及其祖先，避免下面检查容量、分配 slot 和修改树状态时
+        # 这段已有 L1 prefix 被 GPU cache eviction 回收。
         # protect the ancestor nodes from eviction
         result = self.inc_lock_ref(ancester_node)
+
+        # inc_lock_ref() 会把原本可淘汰的节点移入 protected 集合。
+        # delta 通常 <= 0，表示加锁后可用于调度的 evictable GPU token 减少量；
+        # 仅在设置 mem_quota 时用于修正本次允许 load-back 的容量。
         delta = result.delta
 
+        # 将各节点的 host_value（L2 物理 slot 索引）按 token 顺序拼接。
+        # 当前实现对这段连续 prefix 采用 all-or-nothing，不做部分 load-back。
         # load it all or not at all
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
+
+        # 放弃以下低收益或超额任务：
+        # 1. 待恢复 token 少于 load_back_threshold（当前默认 10）；
+        # 2. 设置了 mem_quota，且加锁修正后的配额容纳不下整段 prefix。
+        # 当前 PrefillAdder 调用的 mem_quota=None，因此只应用长度阈值。
         if len(host_indices) < self.load_back_threshold or (
             len(host_indices) > mem_quota + delta if mem_quota is not None else False
         ):
             # skip loading back if the total size is too small or exceeding the memory quota
+            # 没有提交任务，归还上面持有的临时 L1 锚点保护。
             self.dec_lock_ref(ancester_node)
             return None
 
+        # 在分配 L1 slot 和登记任务期间保护 L2 host_value，避免对应 Host slot
+        # 被 Host cache eviction 释放或复用。
         # Protect the nodes being loaded from host eviction.
         for n in nodes_to_load:
             n.protect_host()
 
+        # [主线重点] CacheController.load() 按 host_indices 数量分配 L1 GPU slot，
+        # 把 (host_indices, device_indices, node_id) 加入 load_queue，然后立即
+        # 返回 device_indices；此调用尚未执行实际 Host -> GPU copy。
         device_indices = self.cache_controller.load(
             host_indices=host_indices,
             node_id=last_hit_node.id,
             **self._get_extra_pools(),
         )
+
+        # 首次分配失败说明当前没有足够的空闲 L1 slot。尝试淘汰同等数量的
+        # 其他可淘汰 GPU KV，再进行一次完整长度分配。
         if device_indices is None:
             self.evict(EvictParams(num_tokens=len(host_indices)))
             device_indices = self.cache_controller.load(
@@ -1306,7 +1370,13 @@ class HiRadixCache(RadixCache):
                 node_id=last_hit_node.id,
                 **self._get_extra_pools(),
             )
+
+        # 容量检查和分配阶段已经结束，释放最初的 L1 锚点临时保护。
+        # 成功路径稍后会对 last_hit_node 建立一份 load-back 在途保护。
         self.dec_lock_ref(ancester_node)
+
+        # 淘汰后仍无法分配整段 L1 slot：撤销本次操作，释放所有 L2 临时保护。
+        # 没有 CacheOperation 进入 load_queue，调用方会回退到现有 L1 prefix。
         if device_indices is None:
             # no sufficient GPU memory to load back KV caches
             for n in nodes_to_load:
@@ -1320,44 +1390,90 @@ class HiRadixCache(RadixCache):
             )
             return None
 
+        # L1 slot 已成功分配且搬运映射已进入 load_queue。节点随后会通过
+        # lock_ref 获得在途保护，因此可以释放准备阶段持有的 host_ref_counter。
         for n in nodes_to_load:
             n.release_host()
+
+        # 记录“最深节点 id -> 最深节点”。start_loading() 完成后，loading_check()
+        # 根据 ack 中的同一 node id 删除记录并释放 load-back 在途锁。
         self.ongoing_load_back[last_hit_node.id] = last_hit_node
+
+        # 把返回的 device_indices 按每个 Radix 节点的 token 数重新切片，写入
+        # node.value。此时 value 表示已为该节点预留/排队的 L1 slot；slot 中的
+        # KV 数据可能仍在等待 DMA，forward 会通过 consumer event 等待就绪。
         offset = 0
         for node in nodes_to_load:
             node.value = device_indices[offset : offset + len(node.host_value)].clone()
             offset += len(node.host_value)
+
+            # 发布该节点恢复到 GPU 的缓存事件，供外部 KV event/indexer 消费；
+            # 不负责执行 Host -> GPU 数据复制。
             # Block promoted from host to GPU -- emit store(GPU) so downstream
             # indexers see it as device-local again.
             self._record_store_event(node, medium=StorageMedium.GPU)
+
+        # 新恢复的节点重新进入 L1 容量统计。紧接着 inc_lock_ref() 会将本次
+        # 请求依赖的整条 prefix 转入 protected 状态，防止 DMA/forward 前被淘汰。
         self.evictable_size_ += len(device_indices)
+
+        # 建立 load-back 在途锁。之后 PrefillAdder 还会建立请求生命周期锁；
+        # loading_check() 只释放这里增加的在途锁。
         self.inc_lock_ref(last_hit_node)
 
+        # [当前可跳过] 可选的 HiCache load-back 性能与 token 数指标。
         if self.metrics_collector is not None:
             self.metrics_collector.observe_load_back_duration(
                 time.perf_counter() - start_time
             )
             self.metrics_collector.increment_load_back_num_tokens(len(device_indices))
 
+        # 返回已经分配并登记到树中的 L1 GPU slot 索引，供调用方追加到
+        # req.prefix_indices。数据就绪由后续 start_loading()/consumer event 保证。
         return device_indices
 
+    # TODO: Sparse prefill 需要关注
     def init_load_back(
         self,
         params: InitLoadBackParams,
     ):
+        # 函数整体作用：根据 prefix match 给出的 L2 最深命中节点，决定是否
+        # 提交一次 L2 Host -> L1 GPU load-back，并向调度器返回：
+        #   1. 本次成功预留的 L1 GPU slot 索引；
+        #   2. load-back 后实际可作为 L1 prefix 终点的 Radix Tree 节点。
+        # 本函数只做选择和任务提交；实际逐层 DMA 稍后由 start_loading() 启动。
+        # InitLoadBackParams 是多种缓存实现共用的参数容器；当前 HiRadixCache
+        # 主要使用 best_match_node 和 mem_quota，host_hit_length/req 不直接读取。
+
+        # best_match_node 是本次 prefix match 找到的最深 L2 连续命中节点。
+        # 它若已从 L1 淘汰，evicted=True，同时仍通过 host_value 保有 L2 KV。
         last_node = params.best_match_node
+
+        # 可选的本次 load-back GPU token 上限。当前 PrefillAdder 调用未传入，
+        # 因此为 None，表示不设置额外的单次配额，仍受全局 GPU KV 容量约束。
         mem_quota = params.mem_quota
+
+        # [主线] L2 最深命中节点不在 L1 时，尝试恢复从最近 L1 祖先之后到
+        # last_node 为止的整段连续 L2 prefix。
         if last_node.evicted:
             loading_values = self.load_back(last_node, mem_quota)
+
+            # load_back() 成功时返回新分配的 L1 GPU slot 索引，并已将
+            # Host -> GPU 映射加入 load_queue；last_node 成为新的 L1 逻辑终点。
             if loading_values is not None:
                 logger.debug(
                     f"loading back {len(loading_values)} tokens for node {last_node.id}"
                 )
                 return loading_values, last_node
 
+            # load_back() 可能因命中长度低于阈值、超过 mem_quota，或 GPU slot
+            # 分配失败而返回 None。此时沿父链退回最深的现有 L1 节点；未恢复的
+            # L2 token 不加入 prefix_indices，后续会计入本轮 prefill 输入。
             while last_node.evicted:
                 last_node = last_node.parent
 
+        # 无需或无法 load-back 时返回设备上的空索引 tensor，使调用方可以安全
+        # torch.cat；同时返回当前真正可用的 L1 prefix 终点。
         return (
             self._empty_match_result.device_indices,
             last_node,
@@ -1419,12 +1535,36 @@ class HiRadixCache(RadixCache):
         self.writing_check()
 
     def check_hicache_events(self):
+        # 函数整体作用：在 scheduler 准备新 prefill batch 前，统一收割上一轮
+        # HiCache 异步操作产生的完成事件和控制消息，释放对应的保护引用与内存。
+        # 本函数不会提交新的 L3 -> L2 预取，也不会把某个请求成功预取的 KV
+        # 插入 L2 Radix Tree；请求级结果随后由 check_prefetch_progress(req.rid)
+        # 检查并收割。
+
+        # [当前可跳过] 清理上一轮 Pipeline Parallel rank 间尚未回收的异步发送。
+        # 当前 pp_size=1 时通常没有待处理的 PP work。
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
+
+        # 检查已经完成的 L1 GPU -> L2 Host write-through/write-back 操作，
+        # 完成 Radix Tree 状态更新并释放写入期间持有的节点锁。
+        # 只追踪 L3 -> L2 -> L1 恢复路径时，可以暂时略过其内部实现。
         self.writing_check()
+
+        # [主线] 检查上一轮已经完成的 L2 Host -> L1 GPU load-back，
+        # 消费完成事件，并解除 ongoing_load_back 对缓存节点的保护引用。
         self.loading_check()
+
+        # [主线] 启用 L3 storage 时，处理后台线程发回的控制队列：
+        # 1. 撤销 L3 未达到命中阈值的 prefetch；
+        # 2. 确认 L2 -> L3 backup 完成；
+        # 3. 释放预取或 I/O 完成后不再使用的 L2 Host slot。
+        # 成功的请求级 L3 预取仍由 check_prefetch_progress() 处理。
         if self.enable_storage:
             self.drain_storage_control_queues()
+
+        # [当前可跳过] 只读取 storage backend 统计并上报指标，
+        # 不改变 L1/L2/L3 的缓存状态和请求调度结果。
         if self.enable_storage_metrics:
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()

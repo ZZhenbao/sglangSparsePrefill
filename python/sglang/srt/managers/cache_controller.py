@@ -724,52 +724,132 @@ class HiCacheController:
         """
         Load KV caches from host memory to device memory.
         """
+        # 函数整体作用：为一批 L2 Host KV 预留等量的 L1 GPU slot，并把
+        # Host slot -> GPU slot 映射登记到 load_queue。该函数由 scheduler
+        # 线程同步调用，只进行资源分配和任务入队；实际逐层 Host -> GPU copy
+        # 由后续 start_loading() 在独立 load_stream 上启动。
+        #
+        # 参数含义：
+        # - host_indices：按 prefix token 顺序排列的 L2 Host 物理 slot；
+        # - node_id：本次 load-back 最深 Radix 节点的 id，随 ack 返回，供
+        #   loading_check() 查找 ongoing_load_back 并释放在途锁；
+        # - priority：可选任务优先级，未传入时 CacheOperation 使用创建顺序。
+
+        # [主线] 按待恢复的 L2 token 数，从 L1 KV allocator 分配相同数量的
+        # GPU 物理 slot。返回 tensor 中的每个位置与 host_indices 一一对应。
         device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
+
+        # 没有足够的 L1 slot 时不创建 CacheOperation，也不修改 load_queue。
+        # 调用方 HiRadixCache.load_back() 可以先淘汰其他 L1 KV 后再重试。
         if device_indices is None:
             return None
+
+        # 保存本次 L2 -> L1 的源/目标 slot 映射和追踪 node_id。
+        # start_loading() 会合并当前 load_queue 中的操作，逐层执行实际 KV copy，
+        # 并在完成事件的 ack_list 中带回各操作的 node_id。
         self.load_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
+
+        # 返回已经预留的 L1 slot 索引，供 Radix 节点 value 和
+        # req.prefix_indices 立即登记。此时 slot 中的 KV 数据尚不保证就绪。
         return device_indices
 
     def move_indices(self, host_indices: torch.Tensor, device_indices: torch.Tensor):
-        # move indices to GPU if using kernels, to host if using direct indexing
+        # 函数整体作用：按照 io_backend 的调用要求，调整 L2 源 slot 索引和
+        # L1 目标 slot 索引所在的设备及排列顺序。
+        #
+        # 本函数处理的是索引 tensor，不会搬运 KV 数据，也不会重新分配 L1
+        # slot。输入和输出始终保持逐元素映射：
+        #     host_indices[i] 中的 KV -> device_indices[i] 对应的 GPU slot
+
         if self.io_backend == "kernel":
+            # CUDA/ROCm kernel 直接读取索引，因此 host_indices 也需要位于
+            # accelerator 上；device_indices 由 L1 allocator 返回，已经位于
+            # kernel 所需设备。
             if not host_indices.is_cuda:
+                # non_blocking=True 允许索引复制异步提交。start_loading() 随后
+                # 记录 start_event，并让 load_stream 等待该索引复制完成。
                 host_indices = host_indices.to(self.device, non_blocking=True)
             return host_indices, device_indices
+
         elif self.io_backend == "direct":
             if self.mem_pool_host.layout == "layer_first":
+                # direct 后端在 CPU 侧读取索引，将 L1 目标索引移到 CPU。
                 device_indices = device_indices.cpu()
+
+                # 按 L2 Host slot 升序排列源索引。idx 是原数组的排序置换，
+                # 使用相同置换重排 device_indices，保证每个 L2 -> L1 映射
+                # 在排序后仍然一一对应。
                 host_indices, idx = host_indices.sort()
                 return host_indices, device_indices.index_select(0, idx)
+
             elif self.mem_pool_host.layout == "page_first_direct":
+                # page_first_direct 保留原有 Host 索引顺序，只确保 direct
+                # 搬运实现可以从 CPU 读取 L1 目标 slot 索引。
                 return host_indices, device_indices.cpu()
+
             else:
+                # direct 后端目前只支持上述两种 Host KV 内存布局。
                 raise ValueError(
                     f"Unsupported layout {self.mem_pool_host.layout!r} for io backend 'direct'"
                 )
+
         elif self.io_backend == "kernel_ascend":
+            # Ascend 搬运接口在 CPU 侧读取目标 slot 索引。
             return host_indices, device_indices.cpu()
+
         else:
+            # 尽早拒绝未实现的后端，避免以错误的索引设备启动 KV 搬运。
             raise ValueError(f"Unsupported io backend")
 
     def start_loading(self) -> int:
+        # 函数整体作用：消费此前 load() 登记在 load_queue 中的 L2 -> L1
+        # 搬运任务，在独立 load_stream 上逐层提交 Host KV -> GPU KV copy，
+        # 并返回本轮事件组的索引。scheduler 会把该索引交给 forward，使
+        # forward 在读取第 i 层 KV 前等待对应的第 i 层复制完成。
+        #
+        # 本函数只异步提交搬运，不在 CPU 侧等待全部 KV 复制完成；最后一层
+        # 完成后产生的 ack 由后续 loading_check() 收割并释放 load-back 在途锁。
+
+        # 本轮没有 L2 -> L1 任务，无需建立同步关系。-1 会使 forward 跳过
+        # HiCache 的逐层等待。
         if len(self.load_queue) == 0:
             return -1
 
+        # [主线] 从循环复用的事件组中取得一个 producer_id。本轮每层复制的
+        # 完成事件都会记录在该事件组中；返回后它也会成为 batch 的
+        # hicache_consumer_index。
         producer_id = self.layer_done_counter.update_producer()
+
+        # 将本轮各请求分别登记的 CacheOperation 合并成一组连续索引：
+        # host_indices 是 L2 源 slot，device_indices 是已提前分配的 L1 目标
+        # slot，node_ids 保留每个 load-back 的完成确认 id。
+        # batch_size=1 时通常只有一个操作，merge_ops() 会直接返回它。
         op = CacheOperation.merge_ops(self.load_queue)
+
+        # 根据 io_backend 调整索引所在设备及排列方式，供底层 copy 实现使用；
+        # 源/目标 slot 的对应关系保持一致。
         host_indices, device_indices = self.move_indices(
             op.host_indices, op.device_indices
         )
+
+        # 任务已由局部变量 op 接管，清空队列，避免下一轮重复提交。
         self.load_queue.clear()
+
+        # 当前计算 stream 记录起点事件。若 move_indices() 在当前 stream 上
+        # 异步移动过索引，load_stream 必须先等待该事件再读取这些索引。
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
+        # [主线] 切换到独立 load_stream。with 块只负责按顺序提交 GPU 工作，
+        # 离开该块不代表所有 Host -> GPU copy 已经完成。
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             for i in range(self.layer_num):
+                # 把所有 host_indices 对应的第 i 层 KV 写入已分配的
+                # device_indices。按层搬运允许 forward 在前几层就绪后开始计算，
+                # 与后续层的 KV 搬运重叠。
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
                     host_indices,
@@ -777,6 +857,9 @@ class HiCacheController:
                     i,
                     self.io_backend,
                 )
+
+                # [当前可跳过] 推测解码启用 draft KV pool 时，同步恢复 draft
+                # 模型对应层的 KV；当前未启用 speculative decoding 时不进入。
                 if self.has_draft and i < self.mem_pool_host_draft.layer_num:
                     self.mem_pool_host_draft.load_to_device_per_layer(
                         self.mem_pool_device_draft,
@@ -785,15 +868,24 @@ class HiCacheController:
                         i,
                         self.io_backend,
                     )
+
+                # 在 load_stream 上记录“第 i 层复制已完成”事件。forward 使用
+                # producer_id 对应的 consumer event，在读取该层 GPU slot 前等待。
                 producer_event.complete(i)
+
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the load stream is executing.
+            # 告知 PyTorch caching allocator：这些索引 tensor 仍被 load_stream
+            # 异步使用，在该 stream 完成前不能回收或复用其底层显存。
             if host_indices.is_cuda:
                 host_indices.record_stream(self.load_stream)
             if device_indices.is_cuda:
                 device_indices.record_stream(self.load_stream)
 
+        # 将本轮最后一层的完成事件和所有 node_id 放入确认队列。
+        # loading_check() 等 finish_event 就绪后，会用 node_ids 找到
+        # ongoing_load_back 中的节点并释放对应的在途保护引用。
         self.ack_load_queue.append(
             HiCacheAck(
                 start_event=producer_event.start_event,
@@ -801,6 +893,9 @@ class HiCacheController:
                 node_ids=op.node_ids,
             )
         )
+
+        # 返回事件组索引；scheduler 写入 new_batch.hicache_consumer_index，
+        # 随后的 forward 据此逐层等待本轮 L2 -> L1 数据就绪。
         return producer_id
 
     def evict_device(self, device_indices: torch.Tensor) -> int:

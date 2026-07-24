@@ -968,6 +968,20 @@ class PrefillAdder:
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
+        # 函数整体作用：判断一个 waiting request 能否加入当前 prefill batch。
+        # 调用本函数前，req 已完成 L3 -> L2 结果收割和最新一次 prefix match。
+        # 本函数依次完成：
+        #   1. 计算该请求需要的 GPU KV 与 prefill token 预算；
+        #   2. 临时保护已命中的 Radix Tree 节点，避免准入期间被淘汰；
+        #   3. 若存在 L2 Host 命中，调用 init_load_back() 预留 L1 slot，
+        #      并把 L2 -> L1 操作加入 load_queue；
+        #   4. 设置本轮 extend 范围，将请求加入 can_run_list 并扣减预算。
+        # 返回值表示外层调度器能否继续尝试加入下一个请求。实际 L2 -> L1 DMA
+        # 会在 scheduler 随后调用 ready_to_load_host_cache() 时统一启动。
+        # 当前配置中 has_chunked_req=False、truncation_align_size=None；
+        # has_chunked_req 在当前实现中没有被读取。
+
+        # [当前可跳过] Prefill Delayer 的跨 rank/负载准入决策。
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
                 local_prefillable=True,
@@ -978,18 +992,27 @@ class PrefillAdder:
             )
         ):
             return AddReqResult.OTHER
+
+        # [当前可跳过] DSA Context Parallel 当前只允许一个 prefill request。
         # TODO support cp with multiple requests
         # Enabling context parallelism currently presents precision issues;
         # therefore, the prefill-batch setting is temporarily set to 1.
         if (self.dsa_prefill_cp_in_seq_split) and len(self.can_run_list) >= 1:
             return AddReqResult.OTHER
 
+        # [当前可跳过] 可选的单个 prefill batch 请求数上限；当前单请求配置
+        # 已由 max_running_requests=1 限制。
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
 
+        # [当前可跳过] Radix Cache 被关闭且请求忽略 EOS 时使用的特殊准入路径。
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
+        # [主线] 估算该请求整个生命周期需要预留的 GPU KV token：
+        # - max_new：尚未生成的最大输出 token 数；
+        # - cand_extend_input_len：当前不在 L1 的输入长度，包含 L2 Host 命中；
+        # - page_size：分页分配可能产生的一页额外开销。
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
         # _update_prefill_budget also deducts.
@@ -1001,18 +1024,28 @@ class PrefillAdder:
             req.prefix_indices
         )
         total_tokens = cand_extend_input_len + max_new + self.page_size
+
+        # [当前可跳过] 仅用于共享 Mamba 状态池；Qwen2.5 此项为 0。
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)
 
+        # [主线] real_input_tokens 表示本轮真正需要执行 prefill 计算的 token 数。
+        # cand_extend_input_len 中的 L2 命中会被 load-back 后直接复用，因此减去
+        # host_hit_length；随后按 page_size 向上对齐以进行预算检查。
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = cand_extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
+
+        # load-back 前 prefix_indices 只包含已在 L1 GPU 的 prefix slot。
         prefix_len = len(req.prefix_indices)
 
+        # [主线] GPU 可用 slot + 可淘汰 cache 仍无法覆盖输入、未来 decode 和
+        # page 开销时拒绝该请求，本轮返回 NO_TOKEN。
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
+        # [当前可跳过] Sliding-Window Attention 使用独立的 SWA KV 预算。
         if self.is_hybrid_swa:
             swa_needed = self._swa_budget_for_req(
                 cand_extend_input_len, swa_host_hit_length=req.swa_host_hit_length
@@ -1020,6 +1053,8 @@ class PrefillAdder:
             if swa_needed >= self.rem_swa_tokens:
                 return AddReqResult.NO_TOKEN
 
+        # [当前可跳过] 无 Chunked Prefill 的多请求 batch 输入预算检查。
+        # 当前 can_run_list 初始为空且最多加入一个请求，不会在这里拦截首个请求。
         if (
             self.rem_chunk_tokens is None
             and len(self.can_run_list) != 0
@@ -1030,11 +1065,16 @@ class PrefillAdder:
             # - if the can_run_list is empty, always accept the first prefill request
             return AddReqResult.OTHER
 
+        # [主线] 在最终检查和 load-back 期间临时锁住当前 L1 命中终点，
+        # 防止其被并发淘汰。退出 with 时释放这份临时准入锁。
         with self._lock_node(req.last_node):
+            # 加锁会减少 tree_cache.evictable_size()，所以 rem_total_tokens 可能
+            # 变小；必须在锁内使用最新容量再次检查。
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
+            # [当前可跳过] 加锁后的 SWA 预算复查。
             if self.is_hybrid_swa:
                 swa_needed = self._swa_budget_for_req(
                     cand_extend_input_len, swa_host_hit_length=req.swa_host_hit_length
@@ -1042,22 +1082,36 @@ class PrefillAdder:
                 if swa_needed >= self.rem_swa_tokens:
                     return AddReqResult.NO_TOKEN
 
+            # [主线重点] host_hit_length > 0 表示部分连续 prefix 只在 L2 Host。
+            # init_load_back() 为这些 token 分配 L1 GPU slot，并把 Host -> GPU
+            # copy 加入 CacheController.load_queue；此处尚未启动实际 DMA。
             if req.needs_host_load_back():
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
-                        best_match_node=req.best_match_node,
-                        host_hit_length=req.host_hit_length,
-                        req=req,
+                        best_match_node=req.best_match_node,  # L2 最深连续命中节点
+                        host_hit_length=req.host_hit_length,  # 需要 L2 -> L1 的 token 数
+                        req=req,  # 传递请求及混合缓存组件所需状态
                     )
                 )
+
+                # 将本次成功 load-back 的 L1 slot 接到原有 L1 prefix 后面。
+                # 若命中长度未达到阈值或 GPU 配额不足，new_indices 可以为空；
+                # prefix_indices 始终描述此刻实际可在 GPU 上复用的连续 prefix。
                 req.prefix_indices = torch.cat([req.prefix_indices, new_indices])
                 prefix_len = len(req.prefix_indices)
+
+                # 记录已经由 Radix Cache 保护的 prefix 边界，供后续释放 KV 时
+                # 区分缓存持有部分和请求新分配部分。
                 req.cache_protected_len = prefix_len
 
+            # [主线] load-back 后重新计算仍需 forward 的输入长度。
+            # 已恢复到 L1 的 token 已进入 prefix_indices，不再计入 input_tokens。
             input_tokens = self.ceil_paged_tokens(
                 len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
             )
 
+            # [当前可跳过] 多请求 non-chunked batch 在实际 load-back 结果确定后，
+            # 再次确认剩余 max_prefill_tokens 能容纳当前请求。
             if (
                 self.rem_chunk_tokens is None
                 and len(self.can_run_list) != 0
@@ -1068,6 +1122,7 @@ class PrefillAdder:
                 # - if the can_run_list is empty, always accept the first prefill request
                 return AddReqResult.OTHER
 
+            # [当前可跳过] Diffusion LLM 使用独立的 block/token 准入路径。
             if self.dllm_config is not None:
                 if self.rem_dllm_tokens <= 0:
                     return AddReqResult.OTHER
@@ -1078,14 +1133,22 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
+            # [主线] 当前关闭 Chunked Prefill，因此 rem_chunk_tokens is None，
+            # 整个未命中 suffix 会在这一轮作为 extend 输入处理。
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill — the whole sequence is committed this iter.
                 req.set_extend_range(
                     len(req.prefix_indices), len(req.full_untruncated_fill_ids)
                 )
+
+                # 请求正式通过本轮准入，外层 scheduler 将用此列表构造 ScheduleBatch。
                 self.can_run_list.append(req)
 
+                # 为请求持久保护当前 Radix prefix，避免 forward 使用期间被淘汰。
                 self._req_inc_lock_ref(req)
+
+                # 扣减本轮 GPU KV、prefill token 和未来 decode 预留预算，
+                # 同时累计 prefix/input 命中统计。
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
@@ -1096,6 +1159,8 @@ class PrefillAdder:
                     req.retracted_stain,
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 )
+            # [当前可跳过] 只有启用 Chunked Prefill且完整 suffix 超过本轮
+            # rem_chunk_tokens 时进入，将请求截断为一个 page 对齐的 chunk。
             else:
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
@@ -1138,6 +1203,8 @@ class PrefillAdder:
                     mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
                 )
 
+        # 返回加入当前请求后的剩余预算状态：CONTINUE 可继续尝试其他请求，
+        # NO_TOKEN 表示 GPU KV 预算耗尽，OTHER 表示 prefill/chunk 等预算已到边界。
         return self.budget_state()
 
     def preempt_to_schedule(self, req: Req, server_args: ServerArgs) -> bool:
