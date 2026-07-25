@@ -229,19 +229,53 @@ class MHATokenToKVPoolHost(HostKVCache):
         layer_id,
         io_backend,
     ):
+        # 函数整体作用：把 L2 Host KV Pool 中指定 token slot 的某一层 K/V，
+        # 搬到 L1 GPU KV Pool 中已经预留好的 token slot。
+        #
+        # 对每个位置 j，逻辑映射始终是：
+        #   Host K/V[layer_id, host_indices[j]]
+        #       -> GPU K/V[layer_id, device_indices[j]]
+        # host_indices 与 device_indices 必须等长且逐元素对应；两边的物理 slot
+        # 编号可以完全不同。
+        #
+        # 参数含义：
+        # - device_pool：L1 GPU KV Pool，提供目标层的 K/V buffer；
+        # - host_indices：L2 Host KV Pool 中的源 token slot；
+        # - device_indices：L1 GPU KV Pool 中已由 allocator 预留的目标 token slot；
+        # - layer_id：本次只恢复的 Transformer 层编号；
+        # - io_backend：Host -> GPU 的搬运实现，支持 kernel/direct/kernel_ascend。
+        #
+        # 该函数由 HiCacheController.start_loading() 在 load_stream 中逐层调用。
+        # 调用只向当前 stream 提交本层搬运，不在 CPU 侧等待完成；调用方会在
+        # 返回后记录本层完成事件，让 forward 在使用这一层 KV 前等待。
+
+        # [主线] 当前 NVIDIA/CUDA 默认使用 kernel backend。搬运 kernel 根据
+        # host_indices 分散读取 Host KV，再按 device_indices 写入 GPU KV。
         if io_backend == "kernel":
+            # [当前可跳过] layer_first 把 Host buffer 组织为
+            # [K/V, layer, token_slot, kv_head, head_dim]。当前默认布局是
+            # page_first；只有显式配置 layer_first 时才进入这里。
             if self.layout == "layer_first":
+                # CUDA JIT kernel 可用时，使用按当前模型 element size
+                # 专门编译的单层 HiCache 搬运 kernel。
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer(
+                        # 目标：GPU 上当前层的全部 K/V token slot。
                         k_cache_dst=device_pool.k_buffer[layer_id],
                         v_cache_dst=device_pool.v_buffer[layer_id],
+                        # 来源：Host 上当前层的全部 K/V token slot。
                         k_cache_src=self.k_buffer[layer_id],
                         v_cache_src=self.v_buffer[layer_id],
+                        # 对每个 j 执行 src[indices_src[j]] -> dst[indices_dst[j]]。
                         indices_dst=device_indices,
                         indices_src=host_indices,
+                        # 一个 token 的单个 K 或 V 包含
+                        # head_num * head_dim 个元素。
                         element_dim=self.element_dim,
                     )
                 else:
+                    # JIT kernel 不可用时，回退到 sgl-kernel 的通用单层搬运
+                    # kernel；数据映射不变，只是底层实现不同。
                     transfer_kv_per_layer(
                         src_k=self.k_buffer[layer_id],
                         dst_k=device_pool.k_buffer[layer_id],
@@ -251,21 +285,34 @@ class MHATokenToKVPoolHost(HostKVCache):
                         dst_indices=device_indices,
                         item_size=self.token_stride_size,
                     )
+
+            # [主线] 当前默认 hicache_mem_layout="page_first"。Host buffer
+            # 按 [K/V, token/page, layer, kv_head, head_dim] 组织，而 GPU KV
+            # Pool 仍按层访问，因此这里需要取得 layer_id 对应的 Host 视图。
             elif self.layout == "page_first":
+                # [主线优先路径] CUDA JIT kernel 可用时，直接使用初始化阶段
+                # 创建的当前层 strided view。transpose 只改变视图和 stride，
+                # 不复制整份 Host KV。
                 if self.can_use_jit:
                     # Transpose [page, layer, ...] -> [layer, page, ...] then
                     # index by layer_id to get a per-layer view with strided layout.
                     # The kernel handles different src/dst strides automatically.
                     jit_transfer_hicache_one_layer(
+                        # GPU 目标 buffer 已经是明确的第 layer_id 层。
                         k_cache_dst=device_pool.k_buffer[layer_id],
                         v_cache_dst=device_pool.v_buffer[layer_id],
+                        # Host 来源是 page_first buffer 的第 layer_id 层视图。
                         k_cache_src=self.k_data_refs[layer_id],
                         v_cache_src=self.v_data_refs[layer_id],
+                        # 保持 Host slot -> GPU slot 的逐元素映射。
                         indices_dst=device_indices,
                         indices_src=host_indices,
                         element_dim=self.element_dim,
                     )
                 else:
+                    # [主线兼容回退] JIT 不可用时，把完整 page_first Host
+                    # buffer、layer_id 和 stride 交给通用 kernel，由 kernel
+                    # 自己计算当前层每个 token 的源地址。
                     transfer_kv_per_layer_pf_lf(
                         src_k=self.k_buffer,
                         dst_k=device_pool.k_buffer[layer_id],
@@ -277,6 +324,9 @@ class MHATokenToKVPoolHost(HostKVCache):
                         item_size=self.token_stride_size,
                         src_layout_dim=self.layout_dim,
                     )
+
+            # [当前可跳过] page_head 是面向特定 page/head 组织方式的 Host
+            # 布局；当前默认 page_first 不进入此分支。
             elif self.layout == "page_head":
                 transfer_kv_per_layer_ph_lf(
                     src_k=self.k_buffer,
@@ -292,8 +342,14 @@ class MHATokenToKVPoolHost(HostKVCache):
                     head_num=self.head_num,
                 )
             else:
+                # kernel backend 只实现了上述三种 Host 内存布局。
                 raise ValueError(f"Unsupported layout: {self.layout}")
+
+        # [当前可跳过] direct backend 不走上面的 gather/scatter kernel，
+        # 而使用 direct 搬运实现。当前默认 io_backend="kernel"。
         elif io_backend == "direct":
+            # layer_first 下直接把当前层的 K/V 源、目标 tensor 列表交给
+            # direct backend，并按 page_size 批量搬运。
             if self.layout == "layer_first":
                 transfer_kv_direct(
                     src_layers=[self.k_buffer[layer_id], self.v_buffer[layer_id]],
@@ -305,6 +361,9 @@ class MHATokenToKVPoolHost(HostKVCache):
                     dst_indices=device_indices,
                     page_size=self.page_size,
                 )
+
+            # page_first_direct 使用适合 direct I/O 的分页布局。底层根据
+            # layer_id 从 Host page 中定位当前层，并写入 GPU 的当前层 K/V。
             elif self.layout == "page_first_direct":
                 transfer_kv_per_layer_direct_pf_lf(
                     src_ptrs=[self.k_buffer, self.v_buffer],
@@ -318,10 +377,15 @@ class MHATokenToKVPoolHost(HostKVCache):
                     page_size=self.page_size,
                 )
             else:
+                # direct backend 当前只支持 layer_first/page_first_direct。
                 raise ValueError(f"Unsupported layout: {self.layout}")
+
+        # [当前可跳过] Ascend NPU 专用路径；当前 NVIDIA/CUDA 不会进入。
         elif io_backend == "kernel_ascend":
             if self.layout == "page_first_direct":
                 # Ascend-specific: transfer KV data for all layers when layer_id == 0
+                # Ascend 接口一次搬完所有层，因此只在外层循环的 layer_id=0
+                # 时真正提交任务；后续 layer_id 不重复搬运。
                 if layer_id == 0:
                     transfer_kv_dim_exchange(
                         device_indices=device_indices,
@@ -334,8 +398,11 @@ class MHATokenToKVPoolHost(HostKVCache):
                         direction=TransferDirection.H2D,
                     )
             else:
+                # Ascend 搬运目前要求 page_first_direct 布局。
                 raise ValueError(f"Unsupported layout: {self.layout}")
         else:
+            # 尽早拒绝未知 backend，避免静默跳过 KV 恢复并让 forward
+            # 读取尚未填充的 GPU slot。
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def backup_from_device_all_layer(

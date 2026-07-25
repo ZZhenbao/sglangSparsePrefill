@@ -136,6 +136,18 @@ struct HicacheKernelParams {
   uint32_t num_layers = 0;  // only used in all_layer transfer
 };
 
+// [主线] 搬运当前 Transformer 层中由 indices_src/indices_dst 指定的
+// 多个 token slot。每个逻辑 worker 负责一对 slot，并由一组 CUDA 线程
+// 合作复制该 token 的完整 K；对于 Qwen2.5 GQA，还会继续复制完整 V。
+//
+// 模板参数：
+// - T：indices_src/indices_dst 的元素类型，只能是 int32_t 或 int64_t；
+// - kElementSize：一个 token 的单个 K（或 V）占用的字节数；
+// - kUnroll：控制每个 worker 使用的线程数和每线程向量读写宽度；
+// - kBlockQuota：本次搬运最多使用的 CUDA block 数；
+// - kBlockSize：每个 CUDA block 的线程数，当前 JIT 固定传入 1024；
+// - kIsMLA：是否使用没有独立 V buffer 的 MLA 路径。Qwen2.5 是 GQA，
+//   因此当前主线实例化为 false，同时搬 K 和 V。
 template <
     typename T,
     int64_t kElementSize,
@@ -144,28 +156,67 @@ template <
     uint32_t kBlockSize,
     bool kIsMLA = false>
 SGL_HICACHE_KERNEL void hicache_transfer_per_layer(const __grid_constant__ HicacheKernelParams params) {
+  // __grid_constant__ 表示 params 是本次 grid 只读的 kernel 启动参数。
+  // SGL_HICACHE_KERNEL 展开为 __global__ 和 __launch_bounds__，所以该函数
+  // 由 CPU 侧 run_one() 启动并在 GPU 上执行。
   using namespace device;
+
+  // 编译期检查线程组织能够整除：
+  // 1. 一个 block 必须能拆成整数个 warp；
+  // 2. 一个 warp 必须能按 kUnroll 拆成整数大小的 worker。
   static_assert(kBlockSize % kWarpThreads == 0);
   static_assert(kWarpThreads % kUnroll == 0);
 
+  // 一个逻辑 worker 由 kNumThreads 个相邻 CUDA 线程组成，这些线程合作
+  // 复制一个 token 的 kElementSize 字节。以 CUDA warp=32 为例：
+  // unroll=1/2/4 时，每个 worker 分别使用 32/16/8 个线程。
   constexpr uint32_t kNumThreads = kWarpThreads / kUnroll;
+
+  // 一个 block 中可同时容纳多少个逻辑 worker。例如 block_size=1024、
+  // unroll=1 时，1024/32=32 个 worker，即一次处理 32 对 slot。
   constexpr uint32_t kWorkersPerBlock = kBlockSize / kNumThreads;
+
+  // 按最大 block quota 计算本轮所有逻辑 worker 的数量。它也是下面
+  // grid-stride loop 的步长；长任务会由同一批 worker 循环处理后续 slot。
   constexpr uint32_t kNumWorkers = kWorkersPerBlock * kBlockQuota;
 
+  // 从只读参数结构中取出源/目标指针和元数据：
+  // - k/v_cache_src、k/v_cache_dst：当前层 Host/GPU K/V buffer 的起始地址；
+  // - indices_src、indices_dst：逐元素对应的 Host/GPU 物理 slot；
+  // - src/dst_stride：相邻 token slot 行起点之间的字节数；
+  // - length：本次需要处理的索引对数量；
+  // - _：num_layers，单层 kernel 不使用。
   const auto& [
     k_cache_dst, v_cache_dst, indices_dst, // dst
     k_cache_src, v_cache_src, indices_src, // src
     kv_cache_src_stride, kv_cache_dst_stride, length, _ // metadata
   ] = params;
 
+  // threadIdx.x / kNumThreads 将相邻线程划入同一个逻辑 worker。
+  // work_id 是该 worker 首先负责的 indices 数组位置；同一 worker 内的
+  // kNumThreads 个线程得到相同 work_id，并合作搬运同一行 K/V。
   const uint32_t work_id = blockIdx.x * kWorkersPerBlock + threadIdx.x / kNumThreads;
+
+  // [主线] i 是 indices 数组的位置，不是 token id。若待搬 token 多于
+  // kNumWorkers，worker 按固定步长继续处理 i+kNumWorkers，直到覆盖 length。
   for (uint32_t i = work_id; i < length; i += kNumWorkers) {
+    // 读取第 i 对物理 slot。例如 pos_src=37、pos_dst=105 表示：
+    // Host KV slot 37 -> GPU KV slot 105。
     const auto pos_src = static_cast<const T*>(indices_src)[i];
     const auto pos_dst = static_cast<const T*>(indices_dst)[i];
+
+    // pointer::offset() 默认按字节偏移。源和目标使用各自 stride，因此
+    // page_first Host 布局和 layer_first GPU 布局的行间距可以不同。
     const auto src_k = pointer::offset(k_cache_src, pos_src * kv_cache_src_stride);
     const auto dst_k = pointer::offset(k_cache_dst, pos_dst * kv_cache_dst_stride);
+
+    // kNumThreads 个线程合作读取该 token 的完整 kElementSize 字节 K，
+    // 暂存到各线程的局部向量，再合作写入目标 GPU slot。
     const auto vec_k = load_vec<kElementSize, kNumThreads>(src_k);
     store_vec<kElementSize, kNumThreads>(dst_k, vec_k);
+
+    // [主线] Qwen2.5 GQA 的 kIsMLA=false，因此除 K 外还要复制独立的 V。
+    // if constexpr 在编译期决定是否保留该代码；MLA 实例不会产生 V 搬运指令。
     if constexpr (!kIsMLA) {
       const auto src_v = pointer::offset(v_cache_src, pos_src * kv_cache_src_stride);
       const auto dst_v = pointer::offset(v_cache_dst, pos_dst * kv_cache_dst_stride);
